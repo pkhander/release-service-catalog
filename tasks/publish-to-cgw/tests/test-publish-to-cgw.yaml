@@ -1,0 +1,113 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: test-push-to-cdn
+spec:
+  description: |
+    Run the push-to-cdn task and verify the results
+  workspaces:
+    - name: tests-workspace
+  tasks:
+    - name: setup
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+      taskSpec:
+        workspaces:
+          - name: data
+        steps:
+          - name: setup-values
+            image: quay.io/konflux-ci/release-service-utils:38c3bfd7479c86b832cba5b61f9bbde40c469393
+            script: |
+              #!/usr/bin/env sh
+              set -eux
+
+              BINARIES_DIR="$(workspaces.data.path)/binaries"
+              mkdir -p "$(workspaces.data.path)/binaries"
+
+              cosign_binaries="cosign cosign-darwin-amd64.gz cosign-darwin-arm64.gz cosign-linux-amd64.gz cosign-linux-arm64.gz cosign-linux-ppc64le.gz cosign-linux-s390x.gz cosign-windows-amd64.gz"
+              gitsign_binaries="gitsign-darwin-amd64.gz gitsign-darwin-arm64.gz gitsign-linux-amd64.gz gitsign-linux-arm64.gz"
+              all_binaries="$cosign_binaries $gitsign_binaries"
+
+              for binary in $all_binaries; do
+                echo "$binary content" > "$BINARIES_DIR/$binary"
+              done
+
+              cat > $(workspaces.data.path)/data.json << EOF
+              {
+                "contentGateway": {
+                  "productName": "product_name_1",
+                  "productCode": "product_code_1",
+                  "productVersionName": "1.1",
+                  "components": [
+                    {
+                      "name": "cosign",
+                      "description": "Red Hat OpenShift Local Sandbox Test",
+                      "shortURL": "/cgw/product_code_1/1.1",
+                      "hidden": "true"
+                    },
+                    {
+                      "name": "gitsign",
+                      "description": "Red Hat OpenShift Local Sandbox Test",
+                      "shortURL": "/cgw/product_code_1/1.1",
+                      "hidden": "true"
+                    }
+                  ]
+                }
+              }
+              EOF
+    - name: run-task
+      taskRef:
+        name: publish-to-cgw
+      params:
+        - name: dataPath
+          value: "data.json"
+        - name: binariesDir
+          value: "binaries"
+        - name: cgwSecret
+          value: "test-publish-to-cgw-secret"
+        - name: subdirectory
+          value: "subdirectory"
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+      runAfter:
+        - setup
+    # - name: check-result
+    #   params:
+    #     - name: srcDestPaths
+    #       value: $(tasks.run-task.results.srcDestPaths)
+    #   workspaces:
+    #     - name: data
+    #       workspace: tests-workspace
+    #   taskSpec:
+    #     params:
+    #       - name: srcDestPaths
+    #     steps:
+    #       - name: check-result
+    #         image: quay.io/konflux-ci/release-service-utils:38c3bfd7479c86b832cba5b61f9bbde40c469393
+    #         env:
+    #           - name: "srcDestPaths"
+    #             value: '$(params.srcDestPaths)'
+    #         script: |
+    #           #!/usr/bin/env sh
+    #           set -x
+
+    #           PREFIX="exodus:/content/origin/files/sha256"
+    #           destination_paths=()
+    #           for file in $(workspaces.data.path)/binaries/*; do
+    #             checksum=$(sha256sum "$file" | awk '{print $1}')
+    #             path="$PREFIX/${checksum:0:2}/$checksum/$(basename "$file")"
+    #             destination_paths+=("$path")
+    #           done
+
+    #           values=($(cat "$srcDestPaths" | jq -r '.[]'))
+    #           for path in "${destination_paths[@]}"; do
+    #             if printf '%s\n' "${values[@]}" | grep -q -x "$path"; then
+    #               echo "Match found: $path"
+    #             else
+    #               echo "No match for: $path"
+    #               exit 1
+    #             fi
+    #           done

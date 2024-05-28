@@ -1,0 +1,60 @@
+---
+- type: file
+  action: create
+  metadata:
+    productName: "Cloud: Ansible NEW Test 1" # RPA
+    productCode: "AnsibleNewTest" # RPA
+    productVersionName: "AnsibleNewTestVersion 1" # RPA
+    description: "Red Hat OpenShift Local Sandbox Test" # RPA
+    label: "Checksum File Sandbox Test" # dynamically_generated
+    order: 0 # dynamically_generated
+    hidden: false #N/A
+    invisible: false #N/A
+    type: "FILE" #N/A
+    differentProductThankYouPage: null  #N/A
+    downloadURL: "/content/origin/test" # dynamically_generated
+    shortURL: "/pub-1/openshift-v4/test" #N/A 
+    md5: null #N/A
+    size: null #N/A
+- type: file
+  action: create
+  metadata:
+    productName: "Cloud: Ansible NEW Test 1"
+    productCode: "AnsibleNewTest"
+    productVersionName: "AnsibleNewTestVersion 1"
+    description: "Red Hat OpenShift Local Sandbox Test"
+    label: "Checksum File Sandbox Test"
+    order: 0
+    hidden: false
+    invisible: false
+    type: "FILE"
+    differentProductThankYouPage: null
+    downloadURL: "/content/origin/test"
+    shortURL: "/pub-1/openshift-v4/test"
+    md5: null
+    size: null
+- type: file
+  action: create
+  metadata:
+    productName: "Cloud: Ansible NEW Test 1"
+    productCode: "AnsibleNewTest"
+    productVersionName: "AnsibleNewTestVersion 1"
+    description: "Red Hat OpenShift Local Sandbox Test"
+    label: "Checksum File Sandbox Test"
+    order: 0
+    hidden: false
+    invisible: false
+    type: "FILE"
+    differentProductThankYouPage: null
+    downloadURL: "/content/origin/test"
+    shortURL: "/pub-1/openshift-v4/test"
+    md5: null
+    size: null
+
+
+
+
+order: 0
+shortURL: "/pub-1/openshift-v4/test"
+md5: null
+size: null
