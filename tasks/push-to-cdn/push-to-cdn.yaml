@@ -72,24 +72,6 @@ spec:
       volumeMounts:
         - name: secrets
           mountPath: "/secrets"
-    - name: extract-binaries-from-image
-      workspaces:
-        - name: data
-          workspace: release-workspace
-      taskRef:
-        resolver: "git"
-        params:
-          - name: url
-            value: $(params.taskGitUrl)
-          - name: revision
-            value: $(params.taskGitRevision)
-          - name: pathInRepo
-            value: tasks/extract-binaries-from-image/extract-binaries-from-image.yaml
-      params:
-        - name: subdirectory
-          value: $(context.pipelineRun.uid)
-        - name: snapshotPath
-          value: "$(tasks.collect-data.results.snapshotSpec)"
     - name: create-destination-path
       image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
       env:
