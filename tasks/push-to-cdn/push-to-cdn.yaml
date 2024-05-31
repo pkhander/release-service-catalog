@@ -1,0 +1,128 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: push-to-cdn
+  labels:
+    app.kubernetes.io/version: "4.1.0"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: >-
+    Tekton task to push content to Red Hat's CDN
+  params:
+    - name: releasePlanAdmission
+      type: string
+      description: The namespaced name of the ReleasePlanAdmission
+      default: "rhtap-releng-tenant/rpa" # This needs to change later
+    - name: subdirectory
+      description: Subdirectory inside the workspace to be used
+      type: string
+      default: ""
+  workspaces:
+    - name: data
+      description: Workspace to save the CR jsons to
+  results:
+    - name: releasePlanAdmission
+      type: string
+      description: The relative path in the workspace to the stored releasePlanAdmission json
+  steps:
+    - name: create-exodus-conf-file
+      image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
+      env:
+        - name: "RELEASE_PLAN_ADMISSION"
+          value: '$(params.releasePlanAdmission)'
+      script: |
+        #!/bin/bash
+        set -e
+
+        EXODUS_ENV=$(get-resource "releaseplanadmission" "$(params.releasePlanAdmission)" "{.spec.data.exodus.env}")
+        output_file="/etc/exodus-rsync.conf"
+        
+        EXODUS_GW_URL="https://exodus-gw.corp.redhat.com"
+        EXODUS_GW_ENV="live"
+        EXODUS_GW_CERT="exodus-prod-cert.crt"
+        EXODUS_GW_KEY="exodus-prod-privatekey.pem"
+
+        # Check if EXODUS_ENV contains "cdn-qa"
+        if [[ "$EXODUS_ENV" == *"cdn-qa"* ]]; then
+          EXODUS_GW_CERT="exodus-stage-cert.crt"
+          EXODUS_GW_KEY="exodus-stage-privatekey.pem"
+          EXODUS_GW_URL="https://exodus-gw.corp.stage.redhat.com"
+        fi
+
+        # Check if EXODUS_ENV contains "cdn-stage"
+        if [[ "$EXODUS_ENV" == *"cdn-stage"* ]]; then
+          EXODUS_GW_ENV="pre"
+        fi
+
+        cat << EOF > $output_file
+        gwcert: $EXODUS_GW_CERT
+        gwkey: $EXODUS_GW_KEY
+        gwurl: $EXODUS_GW_URL
+        gwenv: $EXODUS_GW_ENV
+
+        logger: file:/proc/1/fd/1
+        loglevel: INFO
+
+        environments:
+        - prefix: exodus
+        EOF
+      volumeMounts:
+        - name: secrets
+          mountPath: "/secrets"
+    - name: extract-binaries-from-image
+      workspaces:
+        - name: data
+          workspace: release-workspace
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: tasks/extract-binaries-from-image/extract-binaries-from-image.yaml
+      params:
+        - name: subdirectory
+          value: $(context.pipelineRun.uid)
+        - name: snapshotPath
+          value: "$(tasks.collect-data.results.snapshotSpec)"
+    - name: create-destination-path
+      image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
+      env:
+        - name: "BINARY_DIR_PATH"
+          value: '$(tasks.extract-binaries-from-image.results.binaries_path)'
+      # Under construction
+      # TODO: Update this to do joined publish
+      # https://github.com/release-engineering/exodus-rsync?tab=readme-ov-file#joined-publish
+      script: |
+        #!/bin/bash
+        file_path="$BINARY_DIR_PATH"
+        # Compute the SHA-256 checksum of the file
+        checksum=$(sha256sum "$file_path" | awk '{print $1}')
+        first_two_chars=${checksum:0:2}
+        # Create destination_dir structure
+        destination_dir="exodus:/content/origin/files/sha256/$first_two_chars/$checksum/$(basename "$file_path")"
+        echo "$destination_dir"
+        echo -n $(destination_dir | tee $(results.binaries_path.path)
+
+        EXODUS_CMD=$(exodus-rsync $BINARY_DIR_PATH $destination_dir)
+        echo "$EXODUS_CMD"
+    # TODO: Seperate exodus command from destination path generation
+    # - name: run-exodus-command
+    #   image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
+    #   script: |
+    #     #!/usr/bin/env sh
+    #     OUTPUT=$(exodus-rsync -h)
+    #     exodus-rsync $BINARY_DIR_PATH $
+    #     echo "$OUTPUT"
+    #   volumeMounts:
+    #     - name: secrets
+    #       mountPath: "/secrets"
+  volumes:
+    - name: secrets
+      secret:
+        secretName: cgw-credentials
