@@ -4,7 +4,7 @@ kind: Task
 metadata:
   name: push-to-cdn
   labels:
-    app.kubernetes.io/version: "4.1.0"
+    app.kubernetes.io/version: "0.1.0"
   annotations:
     tekton.dev/pipelines.minVersion: "0.12.1"
     tekton.dev/tags: release
@@ -12,33 +12,41 @@ spec:
   description: >-
     Tekton task to push content to Red Hat's CDN
   params:
-    - name: releasePlanAdmission
+    - name: dataPath
       type: string
-      description: The namespaced name of the ReleasePlanAdmission
-      default: "rhtap-releng-tenant/rpa" # This needs to change later
+      description: >
+        Path to the JSON string of the merged data to use in the data workspace.
+    - name: binaries_dir
+      type: string
+      description: Path where the binaries are stored in the workspace
     - name: subdirectory
       description: Subdirectory inside the workspace to be used
       type: string
       default: ""
   workspaces:
     - name: data
-      description: Workspace to save the CR jsons to
+      description: Workspace to save the results to
   results:
-    - name: releasePlanAdmission
+    - name: srcDestPath
       type: string
-      description: The relative path in the workspace to the stored releasePlanAdmission json
+      description: The relative path in the workspace to the stored source:destination paths
   steps:
     - name: create-exodus-conf-file
+    # TODO: Remove after testing
+    # image: quay.io/redhat-appstudio/release-service-utils:digest
       image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
-      env:
-        - name: "RELEASE_PLAN_ADMISSION"
-          value: '$(params.releasePlanAdmission)'
       script: |
         #!/bin/bash
         set -e
 
-        EXODUS_ENV=$(get-resource "releaseplanadmission" "$(params.releasePlanAdmission)" "{.spec.data.exodus.env}")
-        output_file="/etc/exodus-rsync.conf"
+        DATA_FILE="$(workspaces.data.path)/$(params.dataPath)"
+        if [ ! -f "${DATA_FILE}" ] ; then
+            echo "No data JSON was provided."
+            exit 1
+        fi
+
+        EXODUS_ENV=$(jq -r '.spec.data.exodus.env' $DATA_FILE)
+        exodus_rsync_config_path="$(workspaces.data.path)/$(params.subdirectory)/exodus-rsync.conf"
         
         EXODUS_GW_URL="https://exodus-gw.corp.redhat.com"
         EXODUS_GW_ENV="live"
@@ -57,7 +65,7 @@ spec:
           EXODUS_GW_ENV="pre"
         fi
 
-        cat << EOF > $output_file
+        cat << EOF > $exodus_rsync_config_path
         gwcert: $EXODUS_GW_CERT
         gwkey: $EXODUS_GW_KEY
         gwurl: $EXODUS_GW_URL
@@ -69,42 +77,64 @@ spec:
         environments:
         - prefix: exodus
         EOF
-      volumeMounts:
-        - name: secrets
-          mountPath: "/secrets"
-    - name: create-destination-path
+        echo "exodus-rsync.conf created here: $exodus_rsync_config_path"
+      # How to mount secrets that are in the vault here
+      # volumeMounts:
+      #   - name: secrets
+      #     mountPath: "/secrets"
+    - name: create-source-destination-for-files
       image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
-      env:
-        - name: "BINARY_DIR_PATH"
-          value: '$(tasks.extract-binaries-from-image.results.binaries_path)'
+      script: |
+        #!/bin/bash
+        set -e  
+        BINARIES_PATH="$(workspaces.data.path)/$(params.binaries_dir)"
+
+        # Check if the directory exists
+        if [ ! -d "$BINARIES_PATH" ]; then
+            echo "Directory $BINARIES_PATH does not exist."
+            exit 1
+        fi
+
+        json_output="{}"
+        # Loop through each file in the directory
+        for BINARY_PATH in "$BINARIES_PATH"/*; do
+            if [ -f "$BINARY_PATH" ]; then
+                echo "Processing binary: $(basename "$BINARY_PATH")"
+                checksum=$(sha256sum "$BINARY_PATH" | awk '{print $1}')
+                first_two_chars=${checksum:0:2}
+                destination_path="exodus:/content/origin/files/sha256/$first_two_chars/$checksum/$(basename "$BINARY_PATH")"
+                echo "Destination dir: $destination_path"
+                echo ""
+                echo -n "$destination_path" >> "$(results.srcDestPath.path)"
+                # Add key:value (src:dest) pair to the json_output
+                json_output=$(echo "$json_output" | jq --arg key "$BINARY_PATH" --arg value "$destination_path" '.[$key]=$value')
+            fi
+        done
+
+        OUTPUT_PATH=$(params.subdirectory)/src_dest_combination.json
+        echo -n "$OUTPUT_PATH" > "$(results.destination_path.path)"
+        echo "$json_output" | tee "$(workspaces.data.path)/$OUTPUT_PATH"
+    - name: run-exodus-command
+    # TODO: Remove after testing
+      image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
       # Under construction
       # TODO: Update this to do joined publish
       # https://github.com/release-engineering/exodus-rsync?tab=readme-ov-file#joined-publish
       script: |
         #!/bin/bash
-        file_path="$BINARY_DIR_PATH"
-        # Compute the SHA-256 checksum of the file
-        checksum=$(sha256sum "$file_path" | awk '{print $1}')
-        first_two_chars=${checksum:0:2}
-        # Create destination_dir structure
-        destination_dir="exodus:/content/origin/files/sha256/$first_two_chars/$checksum/$(basename "$file_path")"
-        echo "$destination_dir"
-        echo -n $(destination_dir | tee $(results.binaries_path.path)
-
-        EXODUS_CMD=$(exodus-rsync $BINARY_DIR_PATH $destination_dir)
-        echo "$EXODUS_CMD"
-    # TODO: Seperate exodus command from destination path generation
-    # - name: run-exodus-command
-    #   image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
-    #   script: |
-    #     #!/usr/bin/env sh
-    #     OUTPUT=$(exodus-rsync -h)
-    #     exodus-rsync $BINARY_DIR_PATH $
-    #     echo "$OUTPUT"
-    #   volumeMounts:
-    #     - name: secrets
-    #       mountPath: "/secrets"
-  volumes:
-    - name: secrets
-      secret:
-        secretName: cgw-credentials
+        set -e       
+        conf_dir="$(workspaces.data.path)/$(params.subdirectory)/exodus-rsync.conf"
+        src_dest_json="$(workspaces.data.path)/$(params.subdirectory)/src_dest_combination.json"
+        cat "$src_dest_json" | jq -r 'to_entries[] | "\(.key) \(.value)"' | while read -r src dest; do
+            echo "Running exodus-rsync command..."
+            echo "exodus-rsync --exodus-conf $conf_dir -s $src -d $dest"
+            # TODO: Uncomment below to run the actual command
+            # exodus-rsync --exodus-conf "$conf_dir" "$src" "$dest"
+            echo "exodus-rsync command completed."
+            echo ""
+        done
+  # How to mount secrets that are in the vault here
+  # volumes:
+  #   - name: secrets
+  #     secret:
+  #       secretName: cgw-credentials
