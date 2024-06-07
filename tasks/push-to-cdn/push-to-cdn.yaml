@@ -15,7 +15,7 @@ spec:
     - name: dataPath
       type: string
       description: >
-        Path to the JSON string of the merged data to use in the data workspace.
+        Path to the JSON string of the merged data to use in the data workspace
     - name: binaries_dir
       type: string
       description: Path where the binaries are stored in the workspace
@@ -45,7 +45,7 @@ spec:
             exit 1
         fi
 
-        EXODUS_ENV=$(jq -r '.spec.data.exodus.env' $DATA_FILE)
+        EXODUS_ENV=$(jq -r '.exodus.env' $DATA_FILE)
         exodus_rsync_config_path="$(workspaces.data.path)/$(params.subdirectory)/exodus-rsync.conf"
         
         EXODUS_GW_URL="https://exodus-gw.corp.redhat.com"
@@ -96,23 +96,24 @@ spec:
         fi
 
         json_output="{}"
+        # Prefix for all destination paths
+        prefix="exodus:/content/origin/files/sha256"
         # Loop through each file in the directory
         for BINARY_PATH in "$BINARIES_PATH"/*; do
             if [ -f "$BINARY_PATH" ]; then
-                echo "Processing binary: $(basename "$BINARY_PATH")"
+                binary_name=$(basename "$BINARY_PATH")
+                echo "Processing binary: $binary_name"
                 checksum=$(sha256sum "$BINARY_PATH" | awk '{print $1}')
-                first_two_chars=${checksum:0:2}
-                destination_path="exodus:/content/origin/files/sha256/$first_two_chars/$checksum/$(basename "$BINARY_PATH")"
+                destination_path="$prefix/${checksum:0:2}/$checksum/$binary_name"
                 echo "Destination dir: $destination_path"
                 echo ""
-                echo -n "$destination_path" >> "$(results.srcDestPath.path)"
                 # Add key:value (src:dest) pair to the json_output
                 json_output=$(echo "$json_output" | jq --arg key "$BINARY_PATH" --arg value "$destination_path" '.[$key]=$value')
             fi
         done
 
         OUTPUT_PATH=$(params.subdirectory)/src_dest_combination.json
-        echo -n "$OUTPUT_PATH" > "$(results.destination_path.path)"
+        echo -n "$OUTPUT_PATH" > "$(results.srcDestPath.path)"
         echo "$json_output" | tee "$(workspaces.data.path)/$OUTPUT_PATH"
     - name: run-exodus-command
     # TODO: Remove after testing
