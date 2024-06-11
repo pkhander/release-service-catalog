@@ -112,9 +112,9 @@ spec:
             fi
         done
 
-        OUTPUT_PATH=$(params.subdirectory)/src_dest_combination.json
-        echo -n "$OUTPUT_PATH" > "$(results.srcDestPath.path)"
-        echo "$json_output" | tee "$(workspaces.data.path)/$OUTPUT_PATH"
+        src_dest_json=$(workspaces.data.path)/$(params.subdirectory)/src_dest_combination.json
+        echo -n "$src_dest_json" > "$(results.srcDestPath.path)"
+        echo "$json_output" | tee "$src_dest_json"
     - name: run-exodus-command
     # TODO: Remove after testing
       image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
