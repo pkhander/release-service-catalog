@@ -10,13 +10,25 @@ metadata:
     tekton.dev/tags: release
 spec:
   description: >-
-    Tekton task to push content to Red Hat's CDN
+    Tekton task to push content to Red Hat's CDN using exodus-rsync
   params:
+    - name: exodusGwUrl
+      type: string
+      description: URL of the Exodus Gateway
+    - name: exodusGwEnv
+      type: string
+      description: Environment to use in the Exodus Gateway
+    - name: exodusGwCert
+      type: string
+      description: Secret containing the Exodus Gateway certificate
+    - name: exodusGwKey
+      type: string
+      description: Secret containing the Exodus Gateway key
     - name: dataPath
       type: string
       description: >
         Path to the JSON string of the merged data to use in the data workspace
-    - name: binaries_dir
+    - name: binariesDir
       type: string
       description: Path where the binaries are stored in the workspace
     - name: subdirectory
@@ -32,44 +44,33 @@ spec:
       description: The relative path in the workspace to the stored source:destination paths
   steps:
     - name: create-exodus-conf-file
-    # TODO: Remove after testing
-    # image: quay.io/redhat-appstudio/release-service-utils:digest
-      image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
+      image: quay.io/konflux-ci/release-service-utils:38c3bfd7479c86b832cba5b61f9bbde40c469393
+      env:
+        - name: exodusGwCert
+          valueFrom:
+            secretKeyRef:
+              name: $(params.exodusGwCert)
+              key: cert
+        - name: exodusGwKey
+          valueFrom:
+            secretKeyRef:
+              name: $(params.exodusGwKey)
+              key: key
       script: |
         #!/bin/bash
         set -e
 
-        DATA_FILE="$(workspaces.data.path)/$(params.dataPath)"
-        if [ ! -f "${DATA_FILE}" ] ; then
-            echo "No data JSON was provided."
-            exit 1
-        fi
+        exodus_crt_path="$(workspaces.data.path)/$(params.subdirectory)/exodus.crt"
+        exodus_key_path="$(workspaces.data.path)/$(params.subdirectory)/exodus.key"
+        echo "$exodusGwCert" > $exodus_crt_path
+        echo "$exodusGwKey" > $exodus_key_path
 
-        EXODUS_ENV=$(jq -r '.exodus.env' $DATA_FILE)
         exodus_rsync_config_path="$(workspaces.data.path)/$(params.subdirectory)/exodus-rsync.conf"
-        
-        EXODUS_GW_URL="https://exodus-gw.corp.redhat.com"
-        EXODUS_GW_ENV="live"
-        EXODUS_GW_CERT="exodus-prod-cert.crt"
-        EXODUS_GW_KEY="exodus-prod-privatekey.pem"
-
-        # Check if EXODUS_ENV contains "cdn-qa"
-        if [[ "$EXODUS_ENV" == *"cdn-qa"* ]]; then
-          EXODUS_GW_CERT="exodus-stage-cert.crt"
-          EXODUS_GW_KEY="exodus-stage-privatekey.pem"
-          EXODUS_GW_URL="https://exodus-gw.corp.stage.redhat.com"
-        fi
-
-        # Check if EXODUS_ENV contains "cdn-stage"
-        if [[ "$EXODUS_ENV" == *"cdn-stage"* ]]; then
-          EXODUS_GW_ENV="pre"
-        fi
-
         cat << EOF > $exodus_rsync_config_path
-        gwcert: $EXODUS_GW_CERT
-        gwkey: $EXODUS_GW_KEY
-        gwurl: $EXODUS_GW_URL
-        gwenv: $EXODUS_GW_ENV
+        gwcert: $exodus_crt_path
+        gwkey: $exodus_key_path
+        gwurl: $(params.exodusGwUrl)
+        gwenv: $(params.exodusGwEnv)
 
         logger: file:/proc/1/fd/1
         loglevel: INFO
@@ -78,16 +79,12 @@ spec:
         - prefix: exodus
         EOF
         echo "exodus-rsync.conf created here: $exodus_rsync_config_path"
-      # How to mount secrets that are in the vault here
-      # volumeMounts:
-      #   - name: secrets
-      #     mountPath: "/secrets"
     - name: create-source-destination-for-files
-      image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
+      image: quay.io/konflux-ci/release-service-utils:38c3bfd7479c86b832cba5b61f9bbde40c469393
       script: |
         #!/bin/bash
         set -e  
-        BINARIES_PATH="$(workspaces.data.path)/$(params.binaries_dir)"
+        BINARIES_PATH="$(workspaces.data.path)/$(params.binariesDir)"
 
         # Check if the directory exists
         if [ ! -d "$BINARIES_PATH" ]; then
@@ -116,14 +113,10 @@ spec:
         echo -n "$src_dest_json" > "$(results.srcDestPath.path)"
         echo "$json_output" | tee "$src_dest_json"
     - name: run-exodus-command
-    # TODO: Remove after testing
-      image: quay.io/distribution_relengs/publish-to-dev-portal-test-image
-      # Under construction
-      # TODO: Update this to do joined publish
-      # https://github.com/release-engineering/exodus-rsync?tab=readme-ov-file#joined-publish
+      image: quay.io/konflux-ci/release-service-utils:38c3bfd7479c86b832cba5b61f9bbde40c469393
       script: |
         #!/bin/bash
-        set -e       
+        set -e
         conf_dir="$(workspaces.data.path)/$(params.subdirectory)/exodus-rsync.conf"
         src_dest_json="$(workspaces.data.path)/$(params.subdirectory)/src_dest_combination.json"
         cat "$src_dest_json" | jq -r 'to_entries[] | "\(.key) \(.value)"' | while read -r src dest; do
@@ -134,8 +127,3 @@ spec:
             echo "exodus-rsync command completed."
             echo ""
         done
-  # How to mount secrets that are in the vault here
-  # volumes:
-  #   - name: secrets
-  #     secret:
-  #       secretName: cgw-credentials
