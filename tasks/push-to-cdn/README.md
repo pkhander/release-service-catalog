@@ -7,6 +7,10 @@ Tekton task to push content to Red Hat's CDN
 
 | Name | Description | Optional | Default value |
 |------|-------------|----------|---------------|
+| exodusGwUrl | URL of the Exodus Gateway | No |  |
+| exodusGwEnv | Environment to use in the Exodus GatewayGateway | No |  |
+| exodusGwCert | Secret containing the Exodus Gateway certificate | No |  |
+| exodusGwKey | Secret containing the Exodus Gateway key | No |  |
 | dataPath | Path to the JSON string of the merged data to use in the data workspace | No |  |
 | binaries_dir | The directory inside the workspace where the binaries are stored | Yes | "binaries" |
 | subdirectory | Subdirectory inside the workspace to be used for storing the results | Yes | "" |
