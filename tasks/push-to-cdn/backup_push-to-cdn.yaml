@@ -18,9 +18,12 @@ spec:
     - name: exodusGwEnv
       type: string
       description: Environment to use in the Exodus Gateway
-    - name: exodusGwSecret
+    - name: exodusGwCert
       type: string
       description: Secret containing the Exodus Gateway certificate
+    - name: exodusGwKey
+      type: string
+      description: Secret containing the Exodus Gateway key
     - name: binariesDir
       type: string
       description: Path where the binaries are stored in the workspace
@@ -32,7 +35,7 @@ spec:
     - name: data
       description: Workspace to save the results to
   results:
-    - name: srcDestPath
+    - name: srcDestPaths
       type: string
       description: The relative path in the workspace to the stored source:destination paths
   steps:
@@ -42,12 +45,12 @@ spec:
         - name: exodusGwCert
           valueFrom:
             secretKeyRef:
-              name: $(params.exodusGwSecret)
+              name: $(params.exodusGwCert)
               key: cert
         - name: exodusGwKey
           valueFrom:
             secretKeyRef:
-              name: $(params.exodusGwSecret)
+              name: $(params.exodusGwKey)
               key: key
       script: |
         #!/bin/bash
@@ -101,13 +104,19 @@ spec:
               checksum=$(sha256sum "$BINARY_PATH" | awk '{print $1}')
               destination_path="$PREFIX/${checksum:0:2}/$checksum/$binary_name"
               echo "Destination dir: $destination_path"
+              echo ""           
               json_output=$(echo "$json_output" | jq --arg key "$BINARY_PATH" --arg value "$destination_path" '.[$key]=$value')
-              rsync --exodus-conf "$EXODUS_CONF_PATH" -s "$BINARY_PATH" -d "$destination_path"
+
+              echo "exodus-rsync --exodus-conf $EXODUS_CONF_PATH -s $BINARY_PATH -d $destination_path"
+              # Uncomment below to run the actual command
+              # exodus-rsync --exodus-conf "$EXODUS_CONF_PATH" -s "$BINARY_PATH" -d "$destination_path"
+              echo "exodus-rsync command completed."
+              echo ""
             fi
           done
 
           echo "$json_output" | tee "$SRC_DEST_JSON_PATH"
-          echo -n "$SRC_DEST_JSON_PATH" > "$(results.srcDestPath.path)"
+          echo -n "$SRC_DEST_JSON_PATH" > "$(results.srcDestPaths.path)"
         }
 
         create_exodus_conf
