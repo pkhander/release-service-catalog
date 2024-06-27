@@ -18,20 +18,20 @@ spec:
           - name: data
         steps:
           - name: setup-values
-            image: quay.io/konflux-ci/release-service-utils:38c3bfd7479c86b832cba5b61f9bbde40c469393
+            image: quay.io/distribution_relengs/publish-to-dev-portal-test-image:latest
             script: |
               #!/usr/bin/env sh
               set -eux
 
-              BINARIES_DIR="$(workspaces.data.path)/binaries"
-              mkdir -p "$(workspaces.data.path)/binaries"
+              CONTENT_DIR="$(workspaces.data.path)/contentDir"
+              mkdir -p "$(workspaces.data.path)/contentDir"
 
-              cosign_binaries="cosign cosign-darwin-amd64.gz cosign-darwin-arm64.gz cosign-linux-amd64.gz cosign-linux-arm64.gz cosign-linux-ppc64le.gz cosign-linux-s390x.gz cosign-windows-amd64.gz"
-              gitsign_binaries="gitsign-darwin-amd64.gz gitsign-darwin-arm64.gz gitsign-linux-amd64.gz gitsign-linux-arm64.gz"
+              cosign_binaries="cosign cosign-darwin-amd64.gz cosign-darwin-arm64.gz cosign-linux-amd64.gz cosign-linux-arm64.gz checksum.txt"
+              gitsign_binaries="gitsign-darwin-amd64.gz gitsign-darwin-arm64.gz gitsign-linux-amd64.gz gitsign-linux-arm64.gz checksum.txt"
               all_binaries="$cosign_binaries $gitsign_binaries"
 
               for binary in $all_binaries; do
-                echo "$binary content" > "$BINARIES_DIR/$binary"
+                echo "$binary content" > "$CONTENT_DIR/$binary"
               done
 
               cat > $(workspaces.data.path)/data.json << EOF
@@ -45,13 +45,13 @@ spec:
                       "name": "cosign",
                       "description": "Red Hat OpenShift Local Sandbox Test",
                       "shortURL": "/cgw/product_code_1/1.1",
-                      "hidden": "true"
+                      "hidden": false
                     },
                     {
                       "name": "gitsign",
                       "description": "Red Hat OpenShift Local Sandbox Test",
                       "shortURL": "/cgw/product_code_1/1.1",
-                      "hidden": "true"
+                      "hidden": false
                     }
                   ]
                 }
@@ -74,40 +74,34 @@ spec:
           workspace: tests-workspace
       runAfter:
         - setup
-    # - name: check-result
-    #   params:
-    #     - name: srcDestPaths
-    #       value: $(tasks.run-task.results.srcDestPaths)
-    #   workspaces:
-    #     - name: data
-    #       workspace: tests-workspace
-    #   taskSpec:
-    #     params:
-    #       - name: srcDestPaths
-    #     steps:
-    #       - name: check-result
-    #         image: quay.io/konflux-ci/release-service-utils:38c3bfd7479c86b832cba5b61f9bbde40c469393
-    #         env:
-    #           - name: "srcDestPaths"
-    #             value: '$(params.srcDestPaths)'
-    #         script: |
-    #           #!/usr/bin/env sh
-    #           set -x
+    - name: check-result
+      params:
+        - name: resultDataPath
+          value: $(tasks.run-task.results.resultDataPath)
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+      taskSpec:
+        params:
+          - name: resultDataPath
+        steps:
+          - name: check-result
+            image: quay.io/distribution_relengs/publish-to-dev-portal-test-image:test
+            script: |
+              #!/usr/bin/env bash
+              python3 <<EOF
+              import json
 
-    #           PREFIX="exodus:/content/origin/files/sha256"
-    #           destination_paths=()
-    #           for file in $(workspaces.data.path)/binaries/*; do
-    #             checksum=$(sha256sum "$file" | awk '{print $1}')
-    #             path="$PREFIX/${checksum:0:2}/$checksum/$(basename "$file")"
-    #             destination_paths+=("$path")
-    #           done
+              with open('$(params.resultDataPath)', 'r') as file:
+                  data = json.load(file)
 
-    #           values=($(cat "$srcDestPaths" | jq -r '.[]'))
-    #           for path in "${destination_paths[@]}"; do
-    #             if printf '%s\n' "${values[@]}" | grep -q -x "$path"; then
-    #               echo "Match found: $path"
-    #             else
-    #               echo "No match for: $path"
-    #               exit 1
-    #             fi
-    #           done
+              no_of_files_processed = data.get('no_of_files_processed')
+              cmd_output = data.get('command_output')
+              metadata_file_path = data.get('metadata_file_path')
+
+              assert no_of_files_processed == 9, f'Expected 9 files to be processed, got {no_of_files_processed}'
+              assert cmd_output.startswith('push-cgw-metadata mock called with')
+              assert metadata_file_path.endswith('/cgw_metadata.yaml')
+
+              print('All checks passed')
+              EOF
