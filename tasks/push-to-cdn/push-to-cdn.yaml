@@ -106,7 +106,7 @@ spec:
               echo "Destination dir: $destination_path"
               json_output=$(echo "$json_output" | jq --arg key "$BINARY_PATH" \
                             --arg value "$destination_path" '.[$key]=$value')
-              rsync --exodus-conf "$EXODUS_CONF_PATH" -s "$BINARY_PATH" -d "$destination_path"
+              rsync --exodus-conf "$EXODUS_CONF_PATH" "$BINARY_PATH" "$destination_path"
             fi
           done
 

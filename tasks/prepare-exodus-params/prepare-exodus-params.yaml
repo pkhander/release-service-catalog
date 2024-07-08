@@ -65,6 +65,6 @@ spec:
           EXODUS_GW_ENV="pre"
         fi
 
-        echo $EXODUS_GW_SECRET > $(results.exodusGwSecret.path)
-        echo $EXODUS_GW_URL > $(results.exodusGwUrl.path)
-        echo $EXODUS_GW_ENV > $(results.exodusGwEnv.path)
+        echo -n $EXODUS_GW_SECRET > $(results.exodusGwSecret.path)
+        echo -n $EXODUS_GW_URL > $(results.exodusGwUrl.path)
+        echo -n $EXODUS_GW_ENV > $(results.exodusGwEnv.path)
