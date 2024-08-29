@@ -1,0 +1,147 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: rh-sign-mac-win-binaries
+  labels:
+    app.kubernetes.io/version: "0.1.0"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: >-
+    Tekton task to sign mac and windows binaries using system specific signing hosts
+  params:
+    - name: quayURL
+      type: string
+      description: quay URL of the repo where content will be shared
+      # "TODO: Update the default repo after completion of CLDX-80"
+      default: "quay.io/distribution_relengs/konflux_binary_signing"
+    - name: quaySecret
+      type: string
+      description: Secret to interact with Quay
+      default: "sign-binaries-quay-secrets"
+    - name: contentDir
+      type: string
+      description: Path where the content are stored in the workspace
+    - name: windowsCredentials
+      type: string
+      description: Secret to interact with the Windows signing host
+    - name: macosCredentials
+      type: string
+      description: Secret to interact with the MacOS signing host
+    - name: pipelineRunUid
+      type: string
+      description: Unique identifier for the pipeline run
+  workspaces:
+    - name: data
+      description: Workspace to save the results to
+  results:
+    - name: unsingedMacDigest
+      type: string
+      description: |
+        The digest of the unsigned content pushed using ORAS for signing hosts
+    - name: unsingedWindowsDigest
+      type: string
+      description: |
+        The digest of the unsigned content pushed using ORAS for signing hosts
+    - name: singedMacDigest
+      type: string
+      description: |
+        The digest of the unsigned content pushed using ORAS for signing hosts
+    - name: singedWindowsDigest
+      type: string
+      description: |
+        The digest of the unsigned content pushed using ORAS for signing hosts
+    - name: signingResults
+      type: string
+      description: |
+        The relative path in the workspace to the stored json signing results
+  steps:
+    - name: push-unsigned-using-oras
+      image: quay.io/konflux-ci/release-service-utils:e633d51cd41d73e4b3310face21bb980af7a662f
+      script: |
+        #!/bin/bash
+        set -x
+
+        CONTENT_DIR="$(workspaces.data.path)/$(params.subDirectory)/$(params.contentDir)"
+        MAC_CONTENT = $(CONTENT_DIR)/macos
+        WINDOWS_CONTENT = $(CONTENT_DIR)/windows
+        LINUX_CONTENT = $(CONTENT_DIR)/linux
+
+        mkdir -p $MAC_CONTENT $WINDOWS_CONTENT $LINUX_CONTENT
+        cd $CONTENT_DIR
+
+        # Loop through each gz file and move them to the appropriate directory
+        for file in *.gz; do
+          case "$file" in
+            *darwin*)
+              mv "$file" macos/
+              ;;
+            *windows*)
+              mv "$file" windows/
+              ;;
+            *linux*)
+              mv "$file" linux/
+              ;;
+          esac
+        done
+
+        # Unzip files in each directory
+        for dir in macos windows; do
+          for file in "$dir"/*.gz; do
+            gunzip "$file"
+          done
+        done
+
+        echo "Pushing unsigned Macos content to $(params.quayURL)..."
+        output=$(oras push $(params.quayURL) $MAC_CONTENT)
+        mac_digest=$(echo "$output" | grep 'Digest:' | awk '{print $2}')
+        echo "Digest for mac content: $mac_digest"
+        echo -n $digest > $(results.unsingedMacDigest.path)
+
+        echo "Pushing unsigned Windows content to $(params.quayURL)..."
+        output=$(oras push $(params.quayURL) $WINDOWS_CONTENT)
+        windows_digest=$(echo "$output" | grep 'Digest:' | awk '{print $2}')
+        echo "Digest for windows content: $windows_digest"
+        echo -n $digest > $(results.unsingedWindowsDigest.path)
+
+    # TODO: https://issues.redhat.com/browse/CLDX-79
+    # - name: sign-mac-binaries
+    #   image: quay.io/konflux-ci/release-service-utils:e633d51cd41d73e4b3310face21bb980af7a662f
+    #   script: |
+    #     #!/bin/bash
+    #     set -x
+
+    #     # All operations below are expected to be ran inside mac vm
+
+    #     echo "Pulling unsigned MAC content from $(params.quayURL)..."
+    #     mkdir -p $(workspaces.data.path)/$(params.subDirectory)
+    #     cd $(workspaces.data.path)/$(params.subDirectory)
+    #     oras pull $(params.quayURL)@$(unsingedMacDigest)
+
+    # TODO: https://issues.redhat.com/browse/CLDX-78
+    # - name: sign-windows-binaries
+    #   image: quay.io/konflux-ci/release-service-utils:e633d51cd41d73e4b3310face21bb980af7a662f
+    #   script: |
+    #     #!/bin/bash
+    #     set -x
+
+    #     # All operations below are expected to be ran inside windows vm
+
+    #     echo "Pulling unsigned Windows content from $(params.quayURL)..."
+    #     mkdir -p $(workspaces.data.path)/$(params.subDirectory)
+    #     cd $(workspaces.data.path)/$(params.subDirectory)
+    #     oras pull $(params.quayURL)@$(unsingedWindowsDigest)
+
+    - name: pull-signed-using-oras
+      image: quay.io/konflux-ci/release-service-utils:e633d51cd41d73e4b3310face21bb980af7a662f
+      script: |
+        #!/bin/bash
+        set -x
+
+        echo "Pulling signed content from $(params.quayURL)..."
+        mkdir -p $(workspaces.data.path)/$(params.subDirectory)/signed
+        cd $(workspaces.data.path)/$(params.subDirectory)/signed
+        oras pull $(params.quayURL)@$(singedMacDigest)
+        oras pull $(params.quayURL)@$(singedWindowsDigest)
