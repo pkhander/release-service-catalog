@@ -55,7 +55,7 @@ spec:
         set -x
 
         WORKSPACE_DIR="$(workspaces.data.path)/$(params.subdirectory)"
-        BINARIES_DIR="$(workspaces.data.path)/$(params.binariesDir)"
+        BINARIES_DIR="$(params.binariesDir)"
         EXODUS_CONF_PATH="$WORKSPACE_DIR/exodus-rsync.conf"
         EXODUS_CERT_PATH="$WORKSPACE_DIR/exodus.crt"
         EXODUS_KEY_PATH="$WORKSPACE_DIR/exodus.key"
