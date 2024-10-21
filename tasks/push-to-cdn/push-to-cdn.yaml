@@ -4,7 +4,7 @@ kind: Task
 metadata:
   name: push-to-cdn
   labels:
-    app.kubernetes.io/version: "0.2.1"
+    app.kubernetes.io/version: "0.2.2"
   annotations:
     tekton.dev/pipelines.minVersion: "0.12.1"
     tekton.dev/tags: release
@@ -55,7 +55,7 @@ spec:
         set -x
 
         WORKSPACE_DIR="$(workspaces.data.path)/$(params.subdirectory)"
-        BINARIES_DIR="$(workspaces.data.path)/$(params.binariesDir)"
+        BINARIES_DIR="$(params.binariesDir)"
         EXODUS_CONF_PATH="$WORKSPACE_DIR/exodus-rsync.conf"
         EXODUS_CERT_PATH="$WORKSPACE_DIR/exodus.crt"
         EXODUS_KEY_PATH="$WORKSPACE_DIR/exodus.key"

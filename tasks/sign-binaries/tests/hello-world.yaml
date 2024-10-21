@@ -1,0 +1,210 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: hello-world-task
+  labels:
+    app.kubernetes.io/version: "0.2.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: >-
+    Tekton task to sign mac and windows binaries using system specific signing hosts
+  params:
+    - name: quayURL
+      type: string
+      default: quay.io/konflux-artifacts
+    - name: quaySecret
+      type: string
+      default: quay-credentials
+    - name: checksumUser
+      type: string
+      default: konflux-release-service-sa
+    - name: checksumHost
+      type: string
+      default: etera-worker.hosted.upshift.rdu2.redhat.com
+    - name: pipelineRunUid
+      type: string
+      default: '1234'
+    - name: contentDir
+      type: string
+      default: "content"
+    - name: subDirectory
+      type: string
+      default: ""
+  volumes:
+    - name: windows-ssh-key-vol
+      secret:
+        secretName: windows-ssh-key
+    - name: checksum-keytab-vol
+      secret:
+        secretName: checksum-keytab
+    - name: checksum-fingerprint-vol
+      secret:
+        secretName: checksum-fingerprint
+  results:
+    - name: signedWindowsDigest
+      type: string
+      description: |
+        The digest of the unsigned content pushed using ORAS for signing hosts
+    - name: signedMacDigest
+      type: string
+      description: |
+        The digest of the unsigned mac content pushed using ORAS for signing hosts
+  steps:
+    - name: setup-content-dir
+      image: quay.io/konflux-ci/release-service-utils:e633d51cd41d73e4b3310face21bb980af7a662f
+      script: |
+        #!/bin/bash
+        set -x
+
+        yum install podman -y
+        CONTENT_DIR=$(workspaces.data.path)/$(params.pipelineRunUid)/$(params.contentDir)
+        mkdir -p "$CONTENT_DIR"
+        cd "$CONTENT_DIR" || exit 1
+        podman create --name tmp-container quay.io/redhat-user-workloads/rhtas-tenant/cli/cosign@sha256:0d9af9e0bececb32d90de9f74fbc2bb4622af2fcebf862de0bdfd40a19192fdc
+        podman cp tmp-container:/usr/local/bin/ .
+        sleep 600
+
+    # - name: push-unsigned-using-oras
+    #   image: quay.io/konflux-ci/release-service-utils:e633d51cd41d73e4b3310face21bb980af7a662f
+    #   script: |
+    #     #!/bin/bash
+    #     set -x
+
+    #     CONTENT_DIR=$(workspaces.data.path)/$(params.pipelineRunUid)/$(params.contentDir)
+    #     UNSIGNED_DIR=$CONTENT_DIR/unsigned
+    #     MAC_CONTENT=$UNSIGNED_DIR/macos
+    #     WINDOWS_CONTENT=$UNSIGNED_DIR/windows
+    #     LINUX_CONTENT=$CONTENT_DIR/linux
+
+    #     mkdir -p "$MAC_CONTENT" "$WINDOWS_CONTENT" "$LINUX_CONTENT"
+    #     cd "$CONTENT_DIR" || exit 1
+
+    #     # Loop through each gz file and move them to the appropriate directory
+    #     for file in *.gz; do
+    #       case "$file" in
+    #         (*darwin*)
+    #           mv "$file" macos/
+    #           ;;
+    #         (*windows*)
+    #           mv "$file" windows/
+    #           ;;
+    #         (*linux*)
+    #           mv "$file" linux/
+    #           ;;
+    #       esac
+    #     done
+
+    #     # Unzip files in each directory
+    #     for dir in macos windows; do
+    #       for file in "$dir"/*.gz; do
+    #         gunzip "$file"
+    #       done
+    #     done
+
+    #     echo "Pushing unsigned Macos content to $(params.quayURL)..."
+    #     output=$(oras push "$(params.quayURL)" "$MAC_CONTENT")
+    #     mac_digest=$(echo "$output" | grep 'Digest:' | awk '{print $2}')
+    #     echo "Digest for mac content: $mac_digest"
+    #     echo -n "$mac_digest" > "$(results.unsignedMacDigest.path)"
+
+    #     echo "Pushing unsigned Windows content to $(params.quayURL)..."
+    #     output=$(oras push "$(params.quayURL)" "$WINDOWS_CONTENT")
+    #     windows_digest=$(echo "$output" | grep 'Digest:' | awk '{print $2}')
+    #     echo "Digest for windows content: $windows_digest"
+    #     echo -n "$windows_digest" > "$(results.unsignedWindowsDigest.path)"
+    # - name: sign-windows-binaries
+    #   image: quay.io/konflux-ci/release-service-utils:e633d51cd41d73e4b3310face21bb980af7a662f
+    #   volumeMounts:
+    #     - name: checksum-fingerprint-vol
+    #       mountPath: "/etc/secrets1"
+    #       readOnly: true
+    #     - name: checksum-keytab-vol
+    #       mountPath: "/etc/secrets"
+    #       readOnly: true
+    #   env:
+    #     - name: QUAY_USER
+    #       valueFrom:
+    #         secretKeyRef:
+    #           name: $(params.quaySecret)
+    #           key: username
+    #     - name: QUAY_PASS
+    #       valueFrom:
+    #         secretKeyRef:
+    #           name: $(params.quaySecret)
+    #           key: password
+    #   script: |
+    #     #!/usr/bin/env bash
+
+    #     export KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u)
+    #     kinit -kt /etc/secrets/keytab konflux-release-signing-sa@IPA.REDHAT.COM
+    #     klist -A
+
+    #     mkdir -p /root/.ssh
+    #     chmod 700 /root/.ssh
+    #     cp "/etc/secrets1/fingerprint" /root/.ssh/known_hosts
+    #     chmod 600 root/.ssh/known_hosts
+
+    #     SCP_OPTS="-o UserKnownHostsFile=/root/.ssh/known_hosts"
+    #     SSH_OPTS="${SCP_OPTS} $(params.checksumUser)@$(params.checksumHost)"
+
+    #     #  MISSING CONTENT DIR PARAM
+    #     CONTENT_DIR="$(workspaces.data.path)/$(params.subDirectory)/$(params.contentDir)"
+    #     SIGNED_DIR="$(workspaces.data.path)/$(params.subDirectory)/signed"
+
+    #     # get all of the signed binaries into a common directory
+    #     mkdir -p $SIGNED_DIR
+    #     cp -r ${CONTENT_DIR}/linux/* $SIGNED_DIR
+    #     cd $SIGNED_DIR
+    #     oras login quay.io -u $QUAY_USER -p $QUAY_PASS
+
+    #     signed_mac_digest=$(cat "$(results.signedMacDigest.path)")
+    #     signed_windows_digest=$(cat "$(results.signedWindowsDigest.path)")
+
+    #     oras pull $(params.quayURL)/signed@${signed_mac_digest}
+    #     oras pull $(params.quayURL)/signed@${signed_windows_digest}
+
+    #     # generate checksums for all of the binaries
+    #     > sha256sum.txt
+    #     for file in *; do
+    #         if [ -f "$file" ]; then
+    #         checksum=$(sha256sum "$file" | awk '{ print $1 }')
+    #         echo "$checksum  $file" >> sha256sum.txt  # Append checksum, two spaces, and file name
+    #         fi
+    #     done
+    #     cat sha256sum.txt
+    #     exit 0
+    #     # Send sha256sum.txt to the checksum host for signing
+    #     SHA_SUM_PATH="${params.pipelineRunUid}/checksum/sha256sum.txt"
+    #     ssh "$SSH_OPTS" "mkdir -p ~/$(params.pipelineRunUid)/checksum"
+    #     scp "$SCP_OPTS" sha256sum.txt "${CHECKSUM_USER}@${CHECKSUM_HOST}:~/${SHA_SUM_PATH}"
+
+    #     # ssh command to obtain fresh kerberos ticket
+    #     ssh "$SSH_OPTS" "kinit -kt /path/to/keytabfile user@REALM"
+
+    #     # save ssh output to variable named digest:
+    #     digest=$(ssh "$SSH_OPTS" "sha256sum ~/$(params.pipelineRunUid)/checksum/sha256sum.txt")
+
+    #     # Sample sign command to run on the checksum host:
+    #     # rpm-sign --{{ item.type }} --key {{ item.key | default('redhatrelease2', true) }} --onbehalfof={{ on_behalf_of }} --output {{ item.dest}} {{ item.src }}
+    #     AUTHOR="swickers@redhat.com"
+    #     ssh "$SSH_OPTS" "rpm-sign --clearsign --key redhatrelease2 --onbehalfof=${AUTHOR} --output ~/$(params.pipelineRunUid)/checksum/sha256sum.txt.sig ~/$(params.pipelineRunUid)/checksum/sha256sum.txt"
+    #     ssh "$SSH_OPTS" "rpm-sign --gpgsign --key redhatrelease2 --onbehalfof=${AUTHOR} --output ~/$(params.pipelineRunUid)/checksum/sha256sum.txt.gpg ~/$(params.pipelineRunUid)/checksum/sha256sum.txt"
+  workspaces:
+    - name: data
+      description: A workspace for storing the content to be signed
+      mountPath: /workspace/content
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: TaskRun
+metadata:
+  name: hello-world-taskrun
+spec:
+  taskRef:
+    name: hello-world-task
+  workspaces:
+    - name: data
+      emptyDir: {}
