@@ -17,6 +17,9 @@ Tekton task to publish content to Red Hat's Developer portal using pubtools-cont
 | cgwSecret   | The kubernetes secret to use to authenticate to content-gateway | yes      | publish-to-cgw-secret |
 
 ## Changes in 0.2.3
+* Raise Exception correctly when `pubtools-content-gateway` fails
+
+## Changes in 0.2.3
 * Added logic to handle checksum files
 * Fix bug in computing shortUrl
 

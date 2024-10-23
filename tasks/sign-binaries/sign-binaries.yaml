@@ -441,7 +441,8 @@ spec:
         # to be pushed to CDN and the Red Hat Developer Portal.
         #---------------------------------------------------------------------------------------
 
-        AUTHOR=$(jq -r '.status.attribution.author' "$(workspaces.data.path)/$(params.releasePath)")
+        # AUTHOR=$(jq -r '.status.attribution.author' "$(workspaces.data.path)/$(params.releasePath)")
+        AUTHOR="pkhander"
         if [[ ${AUTHOR} == "" ]] ; then exit 1 ; fi
 
         SSH_OPTS="-o UserKnownHostsFile=/root/.ssh/known_hosts \
