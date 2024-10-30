@@ -57,7 +57,7 @@ spec:
         case "$EXODUS_ENV" in 
           *qa*)
             EXODUS_GW_SECRET="exodus-stage-secret"
-            EXODUS_GW_URL="https://exodus-gw.corp.com"
+            EXODUS_GW_URL="https://exodus-gw.corp.stage.redhat.com"
             ;;
         esac
 

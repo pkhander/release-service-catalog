@@ -26,7 +26,7 @@ spec:
               cat > $(workspaces.data.path)/data.json << EOF
               {
                 "cdn": {
-                  "env": "cdn-qa"
+                  "env": "qa"
                 }
               }
               EOF
