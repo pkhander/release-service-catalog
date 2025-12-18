@@ -1,0 +1,315 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: push-to-cdn
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to push artifacts to CDN and Developer Portal.
+    
+    This task supports multiple targets based on snapshot data:
+    - Exodus CDN (exodus-rsync) for Developer Portal
+    - Pulp for Customer Portal
+    - Content Gateway (CGW) for metadata publishing
+    
+    It reads signed artifacts and checksums from workspace and pushes to CDN.
+  params:
+    - name: snapshot_json
+      type: string
+      description: String containing a JSON representation of the snapshot spec
+    - name: exodusGwSecret
+      type: string
+      description: Env specific secret containing the Exodus Gateway configs
+    - name: exodusGwEnv
+      type: string
+      description: Environment to use in the Exodus Gateway. Options are [live, pre]
+    - name: pulpSecret
+      type: string
+      description: Env specific secret containing the rhsm-pulp credentials
+    - name: udcacheSecret
+      type: string
+      description: Env specific secret containing the udcache credentials
+    - name: cgwHostname
+      type: string
+      description: Env specific hostname for content gateway
+      default: https://developers.redhat.com/content-gateway/rest/admin
+    - name: cgwSecret
+      type: string
+      description: Env specific secret containing the content gateway credentials
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: result
+      description: Success if the task succeeds, the error otherwise
+    - name: publishedFiles
+      description: List of published files
+  volumes:
+    - name: exodus-gw-secret
+      secret:
+        secretName: $(params.exodusGwSecret)
+        defaultMode: 0444
+    - name: pulp-secret
+      secret:
+        secretName: $(params.pulpSecret)
+        defaultMode: 0444
+    - name: udcache-secret
+      secret:
+        secretName: $(params.udcacheSecret)
+        defaultMode: 0444
+    - name: cgw-secret
+      secret:
+        secretName: $(params.cgwSecret)
+        defaultMode: 0444
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  workspaces:
+    - name: data
+      description: Workspace containing artifacts to push
+  stepTemplate:
+    securityContext:
+      runAsUser: 1001
+    volumeMounts:
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+
+  steps:
+    - name: push-artifacts
+      image: quay.io/konflux-ci/release-service-utils:d26b427ea3024a0bd0e8dafb996bba3570760e00
+      computeResources:
+        limits:
+          memory: 512Mi
+        requests:
+          memory: 512Mi
+          cpu: 250m
+      volumeMounts:
+        - name: exodus-gw-secret
+          mountPath: /mnt/exodusGwSecret
+        - name: pulp-secret
+          mountPath: /mnt/pulpSecret
+        - name: udcache-secret
+          mountPath: /mnt/udcacheSecret
+        - name: cgw-secret
+          mountPath: /mnt/cgwSecret
+      env:
+        - name: "SNAPSHOT_JSON"
+          value: "$(params.snapshot_json)"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        EXODUS_CERT="$(cat /mnt/exodusGwSecret/cert)"
+        EXODUS_KEY="$(cat /mnt/exodusGwSecret/key)"
+        EXODUS_URL="$(cat /mnt/exodusGwSecret/url)"
+        PULP_URL="$(cat /mnt/pulpSecret/pulp_url)"
+        PULP_CERT="$(cat /mnt/pulpSecret/konflux-release-rhsm-pulp.crt)"
+        PULP_KEY="$(cat /mnt/pulpSecret/konflux-release-rhsm-pulp.key)"
+        UDC_URL="$(cat /mnt/udcacheSecret/url)"
+        UDC_CERT="$(cat /mnt/udcacheSecret/cert)"
+        UDC_KEY="$(cat /mnt/udcacheSecret/key)"
+        CGW_USERNAME="$(cat /mnt/cgwSecret/username)"
+        CGW_PASSWORD="$(cat /mnt/cgwSecret/token)"
+
+        export CGW_USERNAME CGW_PASSWORD
+
+        set -x
+
+        STDERR_FILE=/tmp/stderr.txt
+
+        exitfunc() {
+            local err=$1
+            local line=$2
+            local command="$3"
+            if [ "$err" -eq 0 ] ; then
+                echo -n "Success" > "$(results.result.path)"
+            else
+                echo > "$(results.publishedFiles.path)"
+                echo "$0: ERROR '$command' failed at line $line - exited with status $err" > "$(results.result.path)"
+                if [ -f "$STDERR_FILE" ] ; then
+                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                fi
+            fi
+            exit 0
+        }
+        trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
+
+        # Setup required variables
+        export EXODUS_GW_CERT=/tmp/exodus.crt
+        export EXODUS_GW_KEY=/tmp/exodus.key
+        EXODUS_CONF_PATH=/tmp/exodus-rsync.conf
+        export PULP_CERT_FILE=/tmp/pulp.crt
+        export PULP_KEY_FILE=/tmp/pulp.key
+        export UDCACHE_CERT=/tmp/udc.crt
+        export UDCACHE_KEY=/tmp/udc.key
+        EXODUS_GW_ENV=$(params.exodusGwEnv)
+        export EXODUS_GW_ENV
+        export EXODUS_GW_URL="$EXODUS_URL"
+        export EXODUS_PULP_HOOK_ENABLED=True
+        export EXODUS_GW_TIMEOUT=7200
+
+        set +x
+        echo "$EXODUS_CERT" > "$EXODUS_GW_CERT"
+        echo "$EXODUS_KEY" > "$EXODUS_GW_KEY"
+        echo "$PULP_CERT" > "$PULP_CERT_FILE"
+        echo "$PULP_KEY" > "$PULP_KEY_FILE"
+        echo "$UDC_CERT" > "$UDCACHE_CERT"
+        echo "$UDC_KEY" > "$UDCACHE_KEY"
+        set -x
+
+        CONTENT_DIR="$(workspaces.data.path)/artifacts"
+
+        # Save the results - list all files from all component directories
+        find "${CONTENT_DIR}" -type f -exec basename {} \; 2>/dev/null \
+          | tail -c 512 | tee "$(results.publishedFiles.path)"
+
+        create_exodus_conf() {
+          echo "Creating Exodus configuration file....."
+          set +x
+          cat >"$EXODUS_CONF_PATH" <<EOF
+        gwcert:   $EXODUS_GW_CERT
+        gwkey:    $EXODUS_GW_KEY
+        gwurl:    $EXODUS_GW_URL
+        gwenv:    $EXODUS_GW_ENV
+
+        logger: file:/proc/1/fd/1
+        loglevel: info
+
+        environments:
+          - prefix: exodus
+        EOF
+          set -x
+        }
+
+        push_component_to_pulp() {
+          local component_name=$1
+          local component_dir="${CONTENT_DIR}/${component_name}"
+          
+          version=$(jq -cr --arg name "$component_name" '
+            .components[] | select(.name == $name) | .staged.version // ""
+          ' <<< "$SNAPSHOT_JSON")
+          
+          staged_destination=$(jq -cr --arg name "$component_name" '
+            .components[] | select(.name == $name) | .staged.destination // ""
+          ' <<< "$SNAPSHOT_JSON")
+          
+          if [[ -z "$version" || -z "$staged_destination" ]]; then
+            echo "Error: Pulp push requires both staged.version and staged.destination" \
+              "for component $component_name" >&2
+            exit 1
+          fi
+
+          echo "Pushing component $component_name to customer portal with pulp"
+          cd "$component_dir"
+          
+          staged_json='{"header":{"version": "0.2"},"payload":{"files":[]}}'
+          # shellcheck disable=SC2035
+          while IFS= read -r -d '' file ; do
+              staged_json=$(jq --arg filename "$(basename "$file")" --arg path "$file" \
+                --arg version "$version" \
+                '.payload.files[.payload.files | length] =
+                {"filename": $filename, "relative_path": $path, "version": $version}' <<< "$staged_json")
+          done < <(find * -type f -print0)
+          echo "$staged_json" | yq -P -I 4 > staged.yaml
+
+          pulp_push_wrapper --debug --source "$component_dir" --pulp-url "$PULP_URL" \
+            --pulp-cert $PULP_CERT_FILE --pulp-key $PULP_KEY_FILE --udcache-url "$UDC_URL"
+
+          rm -f staged.yaml
+          cd "$CONTENT_DIR"
+        }
+
+        push_component_to_cdn() {
+          local component_name=$1
+          local component_dir="${CONTENT_DIR}/${component_name}"
+          
+          echo "Pushing component $component_name to CDN with exodus-rsync"
+          create_exodus_conf
+          prefix="exodus:/content/origin/files/sha256"
+          
+          cd "$component_dir"
+          # shellcheck disable=SC2035
+          while IFS= read -r -d '' file; do
+            set +x
+            file_name=$(basename "$file")
+            checksum=$(sha256sum "$file" | awk '{print $1}')
+            destination_path="$prefix/${checksum:0:2}/$checksum/$file_name"
+            set -x
+
+            rsync --exodus-conf "$EXODUS_CONF_PATH" "$file" "$destination_path"
+          done < <(find * -type f -print0)
+          cd "$CONTENT_DIR"
+        }
+
+        publish_component_to_cgw() {
+          local component_name=$1
+          local component_dir="${CONTENT_DIR}/${component_name}"
+          
+          # Update contentDir for this component in SNAPSHOT_JSON
+          SNAPSHOT_JSON=$(
+            jq --arg name "$component_name" --arg dir "$component_dir" '
+              .components |= map(
+                if .name == $name and .contentGateway? then
+                  .contentGateway.contentDir = $dir
+                else
+                  .
+                end
+              )
+            ' <<<"$SNAPSHOT_JSON"
+          )
+        }
+
+        # Process each component
+        NUM_COMPONENTS=$(jq '.components | length' <<< "$SNAPSHOT_JSON")
+        for ((c = 0; c < NUM_COMPONENTS; c++)); do
+          COMPONENT=$(jq -c --arg i "$c" '.components[$i|tonumber]' <<< "$SNAPSHOT_JSON")
+          COMPONENT_NAME=$(jq -r '.name' <<< "$COMPONENT")
+          
+          HAS_STAGED=$(jq -r '.staged | length > 0' <<< "$COMPONENT")
+          HAS_CGW=$(jq -r '.contentGateway | length > 0' <<< "$COMPONENT")
+
+          echo "Processing component: $COMPONENT_NAME (staged=$HAS_STAGED, cgw=$HAS_CGW)"
+
+          # Check if component directory exists and has files
+          COMPONENT_DIR="${CONTENT_DIR}/${COMPONENT_NAME}"
+          if [ ! -d "$COMPONENT_DIR" ] || [ -z "$(ls -A "$COMPONENT_DIR" 2>/dev/null)" ]; then
+            echo "Warning: No files found for component $COMPONENT_NAME, skipping..."
+            continue
+          fi
+
+          if [[ "$HAS_STAGED" == "true" ]]; then
+            # Push to customer portal (pulp) - CDN push not needed when using pulp
+            push_component_to_pulp "$COMPONENT_NAME" 2> "$STDERR_FILE"
+          elif [[ "$HAS_CGW" == "true" ]]; then
+            # Only push to CDN when NOT pushing to pulp
+            push_component_to_cdn "$COMPONENT_NAME" > >(tee "$STDERR_FILE") 2>&1 || true
+          fi
+          
+          if [[ "$HAS_CGW" == "true" ]]; then
+            publish_component_to_cgw "$COMPONENT_NAME"
+          fi
+        done
+
+        # Final CGW publish with all components' contentDir set
+        CGW_PUSH=$(jq 'any(.components[]?.contentGateway?; length > 0)' <<< "$SNAPSHOT_JSON")
+        if [[ "$CGW_PUSH" == "true" ]]; then
+          echo "Publishing all components to CGW..."
+          publish_to_cgw_wrapper \
+            --cgw_host "$(params.cgwHostname)" \
+            --data_json "$SNAPSHOT_JSON" 2> >(tee "$STDERR_FILE" >&2)
+        fi
+
+        echo "Push to CDN complete"
