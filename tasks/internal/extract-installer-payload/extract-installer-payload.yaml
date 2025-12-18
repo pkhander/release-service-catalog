@@ -1,0 +1,300 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: extract-installer-payload
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to inspect OCI artifacts and extract platform-specific metadata.
+    
+    This task:
+    - Fetches OCI manifest for each component in the snapshot
+    - Identifies platform-specific artifacts (macOS, Windows) by artifactType + platform
+    - Returns metadata including pullspecs for signing tasks to pull directly
+    
+    Does NOT extract or re-package content - signing VMs pull directly via oras.
+  params:
+    - name: snapshot_json
+      type: string
+      description: String containing a JSON representation of the snapshot spec
+    - name: macArtifactType
+      type: string
+      description: OCI artifact type for macOS content
+      default: "application/vnd.konflux.detached-signing.v1"
+    - name: macPlatformOS
+      type: string
+      description: Platform OS for macOS artifacts
+      default: "darwin"
+    - name: macPlatformArch
+      type: string
+      description: Platform architecture for macOS artifacts
+      default: "arm64"
+    - name: winArtifactType
+      type: string
+      description: OCI artifact type for Windows content
+      default: "application/vnd.konflux.detached-signing.v1"
+    - name: winPlatformOS
+      type: string
+      description: Platform OS for Windows artifacts
+      default: "windows"
+    - name: winPlatformArch
+      type: string
+      description: Platform architecture for Windows artifacts
+      default: "amd64"
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: result
+      description: Success if the task succeeds, the error otherwise
+    - name: has_mac_content
+      description: "true" if macOS content was found, "false" otherwise
+    - name: has_windows_content
+      description: "true" if Windows content was found, "false" otherwise
+    - name: components_metadata
+      description: JSON array with per-component metadata (pullspecs, platform info)
+    - name: mac_pullspec
+      description: Mac pullspec for first component (for simple pipeline usage)
+    - name: win_pullspec
+      description: Windows pullspec for first component (for simple pipeline usage)
+    - name: component_name
+      description: Name of first component (for simple pipeline usage)
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: redhat-workloads-token
+      secret:
+        secretName: redhat-workloads-token
+        defaultMode: 0444
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    securityContext:
+      runAsUser: 1001
+    volumeMounts:
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+
+  steps:
+    # =========================================================================
+    # Step 1: Inspect OCI manifests and extract metadata
+    # =========================================================================
+    - name: inspect-artifacts
+      image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
+      computeResources:
+        limits:
+          memory: 256Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      volumeMounts:
+        - name: workdir
+          mountPath: /workdir
+        - name: redhat-workloads-token
+          mountPath: /mnt/redhat-workloads-token
+      env:
+        - name: "SNAPSHOT_JSON"
+          value: "$(params.snapshot_json)"
+        - name: "MAC_ARTIFACT_TYPE"
+          value: "$(params.macArtifactType)"
+        - name: "MAC_PLATFORM_OS"
+          value: "$(params.macPlatformOS)"
+        - name: "MAC_PLATFORM_ARCH"
+          value: "$(params.macPlatformArch)"
+        - name: "WIN_ARTIFACT_TYPE"
+          value: "$(params.winArtifactType)"
+        - name: "WIN_PLATFORM_OS"
+          value: "$(params.winPlatformOS)"
+        - name: "WIN_PLATFORM_ARCH"
+          value: "$(params.winPlatformArch)"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        DOCKER_CONFIG_JSON="$(cat /mnt/redhat-workloads-token/.dockerconfigjson)"
+
+        set -x
+
+        STDERR_FILE=/tmp/stderr.txt
+
+        exitfunc() {
+            local err=$1
+            local line=$2
+            local command="$3"
+            if [ "$err" -eq 0 ] ; then
+                echo -n "Success" > "$(results.result.path)"
+            else
+                echo "$0: ERROR '$command' failed at line $line - exited with status $err" \
+                  > "$(results.result.path)"
+                if [ -f "$STDERR_FILE" ] ; then
+                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                fi
+            fi
+            exit 0
+        }
+        trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
+
+        mkdir -p ~/.docker
+        set +x
+        echo "$DOCKER_CONFIG_JSON" | sed -r 's/(^|\})[^{}]+(\{|$)/\1\2/g' > ~/.docker/config.json
+        set -x
+
+        # Initialize platform detection flags
+        HAS_MAC="false"
+        HAS_WINDOWS="false"
+
+        # Initialize components metadata array
+        COMPONENTS_METADATA="[]"
+
+        NUM_COMPONENTS=$(jq '.components | length' <<< "$SNAPSHOT_JSON")
+
+        for ((i = 0; i < NUM_COMPONENTS; i++)) ; do
+            COMPONENT=$(jq -c --arg i "$i" '.components[$i|tonumber]' <<< "$SNAPSHOT_JSON")
+            
+            COMPONENT_NAME=$(jq -er '.name' <<< "${COMPONENT}") \
+                  || (echo "Component $((i + 1)) is missing 'name'" >&2 && exit 1 )
+            PULLSPEC=$(jq -er '.containerImage' <<< "${COMPONENT}") \
+                  || (echo "Component ${COMPONENT_NAME} is missing 'containerImage'" >&2 && exit 1 )
+            
+            echo "Processing component: $COMPONENT_NAME"
+            echo "Base pullspec: $PULLSPEC"
+            
+            # Extract registry and tag/digest from pullspec
+            # Format: registry/repo:tag or registry/repo@sha256:digest
+            if [[ "$PULLSPEC" == *"@"* ]]; then
+                # Already has digest, extract registry/repo
+                OCI_BASE="${PULLSPEC%@*}"
+                OCI_REF="$PULLSPEC"
+            else
+                # Has tag
+                OCI_BASE="${PULLSPEC%:*}"
+                OCI_TAG="${PULLSPEC##*:}"
+                OCI_REF="$PULLSPEC"
+            fi
+            
+            echo "Fetching manifest from: $OCI_REF"
+            
+            # Fetch the manifest index
+            AUTH_FILE=$(mktemp)
+            select-oci-auth "${PULLSPEC}" > "$AUTH_FILE"
+            
+            MANIFEST=$(skopeo inspect --authfile "$AUTH_FILE" --raw "docker://$OCI_REF" 2>"$STDERR_FILE") || {
+                echo "Warning: Could not fetch manifest for $COMPONENT_NAME"
+                continue
+            }
+            
+            # Check if this is a manifest list/index
+            MEDIA_TYPE=$(jq -r '.mediaType // .schemaVersion' <<< "$MANIFEST")
+            echo "Manifest media type: $MEDIA_TYPE"
+            
+            MAC_DIGEST=""
+            WIN_DIGEST=""
+            MAC_PULLSPEC=""
+            WIN_PULLSPEC=""
+            
+            if [[ "$MEDIA_TYPE" == *"manifest.list"* ]] || [[ "$MEDIA_TYPE" == *"image.index"* ]]; then
+                # Multi-platform manifest - find platform-specific digests
+                echo "Multi-platform manifest detected"
+                
+                # Find macOS artifact
+                MAC_DIGEST=$(jq -r --arg type "$MAC_ARTIFACT_TYPE" --arg os "$MAC_PLATFORM_OS" --arg arch "$MAC_PLATFORM_ARCH" \
+                    '.manifests[] | select(
+                        (.artifactType == $type or .annotations["org.opencontainers.image.type"] == $type) and 
+                        .platform.os == $os and 
+                        .platform.architecture == $arch
+                    ) | .digest' <<< "$MANIFEST" | head -1)
+                
+                # Find Windows artifact
+                WIN_DIGEST=$(jq -r --arg type "$WIN_ARTIFACT_TYPE" --arg os "$WIN_PLATFORM_OS" --arg arch "$WIN_PLATFORM_ARCH" \
+                    '.manifests[] | select(
+                        (.artifactType == $type or .annotations["org.opencontainers.image.type"] == $type) and 
+                        .platform.os == $os and 
+                        .platform.architecture == $arch
+                    ) | .digest' <<< "$MANIFEST" | head -1)
+                
+                if [ -n "$MAC_DIGEST" ] && [ "$MAC_DIGEST" != "null" ]; then
+                    MAC_PULLSPEC="${OCI_BASE}@${MAC_DIGEST}"
+                    HAS_MAC="true"
+                    echo "Found macOS artifact: $MAC_PULLSPEC"
+                fi
+                
+                if [ -n "$WIN_DIGEST" ] && [ "$WIN_DIGEST" != "null" ]; then
+                    WIN_PULLSPEC="${OCI_BASE}@${WIN_DIGEST}"
+                    HAS_WINDOWS="true"
+                    echo "Found Windows artifact: $WIN_PULLSPEC"
+                fi
+            else
+                # Single platform manifest - check content
+                echo "Single platform manifest, checking for platform indicators..."
+                
+                # Try to determine platform from labels or file patterns
+                # This is a fallback for non-multi-platform images
+                LABELS=$(jq -r '.config.Labels // {}' <<< "$MANIFEST" 2>/dev/null || echo "{}")
+                
+                # For single manifest, assume it's usable and let signing task determine platform
+                echo "Single manifest - will be used by signing tasks to determine platform content"
+            fi
+            
+            # Add component metadata to array
+            COMPONENT_META=$(jq -n \
+                --arg name "$COMPONENT_NAME" \
+                --arg pullspec "$PULLSPEC" \
+                --arg mac_pullspec "$MAC_PULLSPEC" \
+                --arg win_pullspec "$WIN_PULLSPEC" \
+                --arg mac_digest "$MAC_DIGEST" \
+                --arg win_digest "$WIN_DIGEST" \
+                '{
+                    name: $name,
+                    pullspec: $pullspec,
+                    mac_pullspec: (if $mac_pullspec == "" then null else $mac_pullspec end),
+                    win_pullspec: (if $win_pullspec == "" then null else $win_pullspec end),
+                    mac_digest: (if $mac_digest == "" or $mac_digest == "null" then null else $mac_digest end),
+                    win_digest: (if $win_digest == "" or $win_digest == "null" then null else $win_digest end)
+                }')
+            
+            COMPONENTS_METADATA=$(jq --argjson meta "$COMPONENT_META" '. + [$meta]' <<< "$COMPONENTS_METADATA")
+            
+            rm -f "$AUTH_FILE"
+        done
+
+        echo ""
+        echo "=== Summary ==="
+        echo "Has macOS content: $HAS_MAC"
+        echo "Has Windows content: $HAS_WINDOWS"
+        echo "Components metadata:"
+        echo "$COMPONENTS_METADATA" | jq '.'
+
+        # Write results
+        echo -n "$HAS_MAC" > "$(results.has_mac_content.path)"
+        echo -n "$HAS_WINDOWS" > "$(results.has_windows_content.path)"
+        echo -n "$COMPONENTS_METADATA" > "$(results.components_metadata.path)"
+        
+        # Write simple results for first component (for pipeline usage)
+        FIRST_MAC_PULLSPEC=$(echo "$COMPONENTS_METADATA" | jq -r '.[0].mac_pullspec // ""')
+        FIRST_WIN_PULLSPEC=$(echo "$COMPONENTS_METADATA" | jq -r '.[0].win_pullspec // ""')
+        FIRST_COMPONENT_NAME=$(echo "$COMPONENTS_METADATA" | jq -r '.[0].name // "unknown"')
+        
+        echo -n "$FIRST_MAC_PULLSPEC" > "$(results.mac_pullspec.path)"
+        echo -n "$FIRST_WIN_PULLSPEC" > "$(results.win_pullspec.path)"
+        echo -n "$FIRST_COMPONENT_NAME" > "$(results.component_name.path)"
+
+        echo ""
+        echo "First component: $FIRST_COMPONENT_NAME"
+        echo "  Mac pullspec: $FIRST_MAC_PULLSPEC"
+        echo "  Win pullspec: $FIRST_WIN_PULLSPEC"
+        echo ""
+        echo "Inspection complete. Signing tasks can now pull directly using the pullspecs."
