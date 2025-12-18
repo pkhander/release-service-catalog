@@ -1,0 +1,191 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: sign-windows-binaries
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to sign Windows binaries (.exe, .dll, .node) on a remote Windows VM.
+    
+    This task:
+    - SSHs to the Windows signing VM
+    - Calls sign_windows.bat script with pullspec
+    - Script handles: oras pull, extract, sign all binaries
+    - Returns path to signed binaries for create-windows-installer task
+    
+    Part of the Windows signing pipeline: sign-windows-binaries -> create-windows-installer -> sign-windows-installer
+  params:
+    - name: win_pullspec
+      type: string
+      description: OCI pullspec for the Windows artifact to sign
+    - name: component_name
+      type: string
+      description: Name of the component being signed
+    - name: outputRegistry
+      type: string
+      description: Registry to push signed artifacts to
+      default: quay.io/redhat-pending
+    - name: quaySecret
+      type: string
+      description: Secret containing Quay credentials for oras pull
+      default: quay-credentials
+    - name: windowsCredentials
+      type: string
+      description: Secret containing Windows host credentials (host, username, cert thumbprint)
+      default: windows-credentials
+    - name: windowsSSHKey
+      type: string
+      description: Secret containing SSH private key for Windows host
+      default: windows-ssh-key
+    - name: signerScriptPath
+      type: string
+      description: Path to sign_windows.bat on the Windows VM
+      default: "C:\\tools\\sign_windows.bat"
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: result
+      description: Success if the task succeeds, the error otherwise
+    - name: signed_binaries_pullspec
+      description: OCI pullspec of the signed binaries artifact
+    - name: win_unpacked_path
+      description: Path to the signed win-unpacked directory on the Windows VM (for create-windows-installer)
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: quay-secret
+      secret:
+        secretName: $(params.quaySecret)
+        defaultMode: 0444
+    - name: windows-credentials
+      secret:
+        secretName: $(params.windowsCredentials)
+        defaultMode: 0444
+    - name: windows-ssh-key
+      secret:
+        secretName: $(params.windowsSSHKey)
+        defaultMode: 0400
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    securityContext:
+      runAsUser: 1001
+    volumeMounts:
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+
+  steps:
+    - name: sign-binaries
+      image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
+      computeResources:
+        limits:
+          memory: 256Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      volumeMounts:
+        - name: workdir
+          mountPath: /workdir
+        - name: quay-secret
+          mountPath: /mnt/quay-secret
+        - name: windows-credentials
+          mountPath: /mnt/windows-credentials
+        - name: windows-ssh-key
+          mountPath: /mnt/windows-ssh-key
+      env:
+        - name: WIN_PULLSPEC
+          value: "$(params.win_pullspec)"
+        - name: COMPONENT_NAME
+          value: "$(params.component_name)"
+        - name: OUTPUT_REGISTRY
+          value: "$(params.outputRegistry)"
+        - name: SIGNER_SCRIPT
+          value: "$(params.signerScriptPath)"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        # Load secrets
+        WIN_HOST=$(cat /mnt/windows-credentials/host)
+        WIN_USER=$(cat /mnt/windows-credentials/username)
+        WIN_CERT_THUMBPRINT=$(cat /mnt/windows-credentials/cert_thumbprint)
+        QUAY_USER=$(cat /mnt/quay-secret/username)
+        QUAY_PASS=$(cat /mnt/quay-secret/password)
+
+        set -x
+
+        STDERR_FILE=/tmp/stderr.txt
+        OUTPUT_FILE=/tmp/signer_output.txt
+
+        exitfunc() {
+            local err=$1
+            local line=$2
+            local command="$3"
+            if [ "$err" -eq 0 ] ; then
+                echo -n "Success" > "$(results.result.path)"
+            else
+                echo "$0: ERROR '$command' failed at line $line - exited with status $err" \
+                  > "$(results.result.path)"
+                if [ -f "$STDERR_FILE" ] ; then
+                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                fi
+            fi
+            exit 0
+        }
+        trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
+
+        # Setup SSH
+        mkdir -p ~/.ssh
+        cp /mnt/windows-ssh-key/ssh-privatekey ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        SSH_CMD="ssh $SSH_OPTS ${WIN_USER}@${WIN_HOST}"
+
+        echo "=== Calling sign_windows.bat sign-binaries ==="
+        echo "Pullspec: $WIN_PULLSPEC"
+        echo "Output registry: $OUTPUT_REGISTRY"
+
+        # Call the signer script on the Windows VM
+        # Script handles: oras pull, extract, sign all binaries
+        $SSH_CMD "
+            set CERT_THUMBPRINT=$WIN_CERT_THUMBPRINT
+            set QUAY_USER=$QUAY_USER
+            set QUAY_PASS=$QUAY_PASS
+            
+            $SIGNER_SCRIPT sign-binaries ^
+                --pullspec \"$WIN_PULLSPEC\" ^
+                --output-registry \"$OUTPUT_REGISTRY\" ^
+                --component \"$COMPONENT_NAME\"
+        " 2>"$STDERR_FILE" | tee "$OUTPUT_FILE"
+
+        # Parse output - script outputs signed artifact pullspec on last line
+        SIGNED_PULLSPEC=$(tail -1 "$OUTPUT_FILE" | tr -d '\r\n')
+        
+        # Also get the local win-unpacked path (for create-windows-installer task)
+        WIN_UNPACKED_PATH=$($SSH_CMD "type C:\\temp\\${COMPONENT_NAME}_unpacked_path 2>nul || echo ''" | tr -d '\r\n')
+
+        echo ""
+        echo "=== Sign-windows-binaries complete ==="
+        echo "Signed pullspec: $SIGNED_PULLSPEC"
+        echo "Win-unpacked path: $WIN_UNPACKED_PATH"
+
+        # Write results
+        echo -n "$SIGNED_PULLSPEC" > "$(results.signed_binaries_pullspec.path)"
+        echo -n "$WIN_UNPACKED_PATH" > "$(results.win_unpacked_path.path)"
+

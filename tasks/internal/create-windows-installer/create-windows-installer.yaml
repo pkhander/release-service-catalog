@@ -1,0 +1,217 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: create-windows-installer
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to create Windows NSIS installer from signed binaries.
+    
+    This task:
+    - SSHs to the Windows VM (same as sign-windows-binaries for now)
+    - Uses electron-builder to create NSIS installer from signed win-unpacked
+    - Leaves unsigned installer on disk for sign-windows-installer task
+    
+    Part of the Windows signing pipeline: sign-windows-binaries -> create-windows-installer -> sign-windows-installer
+  params:
+    - name: win_unpacked_path
+      type: string
+      description: Path to the signed win-unpacked directory on Windows VM (from sign-windows-binaries)
+    - name: component_name
+      type: string
+      description: Name of the component being processed
+    - name: windowsCredentials
+      type: string
+      description: Secret containing Windows host credentials
+      default: windows-credentials
+    - name: windowsSSHKey
+      type: string
+      description: Secret containing SSH private key for Windows host
+      default: windows-ssh-key
+    - name: workingDir
+      type: string
+      description: Working directory on the Windows VM
+      default: "C:\\Users\\binary_signer\\signing"
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: result
+      description: Success if the task succeeds, the error otherwise
+    - name: installer_path
+      description: Path to the created installer on the Windows VM
+    - name: installer_name
+      description: Name of the installer file (e.g., "My App Setup 1.0.0.exe")
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: windows-credentials
+      secret:
+        secretName: $(params.windowsCredentials)
+        defaultMode: 0444
+    - name: windows-ssh-key
+      secret:
+        secretName: $(params.windowsSSHKey)
+        defaultMode: 0400
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    securityContext:
+      runAsUser: 1001
+    volumeMounts:
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+
+  steps:
+    - name: create-installer
+      image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
+      computeResources:
+        limits:
+          memory: 256Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      volumeMounts:
+        - name: workdir
+          mountPath: /workdir
+        - name: windows-credentials
+          mountPath: /mnt/windows-credentials
+        - name: windows-ssh-key
+          mountPath: /mnt/windows-ssh-key
+      env:
+        - name: WIN_UNPACKED_PATH
+          value: "$(params.win_unpacked_path)"
+        - name: COMPONENT_NAME
+          value: "$(params.component_name)"
+        - name: WORKING_DIR
+          value: "$(params.workingDir)"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        # Load secrets
+        WIN_HOST=$(cat /mnt/windows-credentials/host)
+        WIN_USER=$(cat /mnt/windows-credentials/username)
+
+        set -x
+
+        STDERR_FILE=/tmp/stderr.txt
+
+        exitfunc() {
+            local err=$1
+            local line=$2
+            local command="$3"
+            if [ "$err" -eq 0 ] ; then
+                echo -n "Success" > "$(results.result.path)"
+            else
+                echo "$0: ERROR '$command' failed at line $line - exited with status $err" \
+                  > "$(results.result.path)"
+                if [ -f "$STDERR_FILE" ] ; then
+                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                fi
+            fi
+            exit 0
+        }
+        trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
+
+        # Setup SSH
+        mkdir -p ~/.ssh
+        cp /mnt/windows-ssh-key/ssh-privatekey ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        SSH_CMD="ssh $SSH_OPTS ${WIN_USER}@${WIN_HOST}"
+
+        REMOTE_WORK_DIR="${WORKING_DIR}\\${COMPONENT_NAME}"
+
+        echo "=== Step 1: Verify signed binaries exist ==="
+        $SSH_CMD "
+            if (-not (Test-Path '$WIN_UNPACKED_PATH')) {
+                Write-Error 'Signed win-unpacked not found at: $WIN_UNPACKED_PATH'
+                exit 1
+            }
+            Write-Host 'Found signed binaries at: $WIN_UNPACKED_PATH'
+            Get-ChildItem '$WIN_UNPACKED_PATH' -Recurse -Include '*.exe' | Select-Object Name
+        " 2>"$STDERR_FILE"
+
+        echo "=== Step 2: Find upstream directory ==="
+        # The upstream directory contains package.json needed by electron-builder
+        UPSTREAM_DIR=$($SSH_CMD "
+            \$packageJson = Get-ChildItem -Path '$REMOTE_WORK_DIR' -Recurse -Filter 'package.json' | Select-Object -First 1
+            if (\$packageJson) {
+                \$packageJson.Directory.FullName
+            }
+        " | tr -d '\r\n')
+        
+        echo "UPSTREAM_DIR: $UPSTREAM_DIR"
+        
+        if [ -z "$UPSTREAM_DIR" ]; then
+            echo "ERROR: Could not find package.json in work directory"
+            exit 1
+        fi
+
+        echo "=== Step 3: Create NSIS installer with electron-builder ==="
+        # Node.js paths on Windows VM
+        WIN_NODE_DIR='C:\Users\binary_signer\node-v20.10.0-win-x64'
+        
+        $SSH_CMD "
+            # Add Node.js to PATH
+            \$env:PATH = '$WIN_NODE_DIR;' + \$env:PATH
+            
+            Set-Location '$UPSTREAM_DIR'
+            
+            # Get relative path from upstream to win-unpacked
+            \$winUnpackedRelative = [System.IO.Path]::GetRelativePath('$UPSTREAM_DIR', '$WIN_UNPACKED_PATH')
+            Write-Host \"WIN_UNPACKED_RELATIVE: \$winUnpackedRelative\"
+            
+            # Run electron-builder
+            # --prepackaged points to the signed win-unpacked directory
+            # Disable code signing in electron-builder (we sign separately)
+            Write-Host 'Running electron-builder...'
+            electron-builder --win nsis --x64 --prepackaged \$winUnpackedRelative --config.win.signAndEditExecutable=false
+            
+            Write-Host ''
+            Write-Host 'Installer created:'
+            Get-ChildItem 'dist\\*.exe'
+        " 2>>"$STDERR_FILE"
+
+        echo "=== Step 4: Get installer path ==="
+        # Find the Setup*.exe installer (not the unpacked exe)
+        INSTALLER_NAME=$($SSH_CMD "
+            \$installer = Get-ChildItem '$UPSTREAM_DIR\\dist\\*Setup*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not \$installer) {
+                # Fallback: find any .exe that's not the main app
+                \$installer = Get-ChildItem '$UPSTREAM_DIR\\dist\\*.exe' | Where-Object { \$_.Name -notmatch '^[^-]+\.exe$' } | Select-Object -First 1
+            }
+            if (\$installer) { \$installer.Name }
+        " | tr -d '\r\n')
+        
+        INSTALLER_PATH="${UPSTREAM_DIR}\\dist\\${INSTALLER_NAME}"
+        
+        echo "INSTALLER_NAME: $INSTALLER_NAME"
+        echo "INSTALLER_PATH: $INSTALLER_PATH"
+
+        # Write results
+        echo -n "$INSTALLER_PATH" > "$(results.installer_path.path)"
+        echo -n "$INSTALLER_NAME" > "$(results.installer_name.path)"
+
+        echo ""
+        echo "=== Create-windows-installer complete ==="
+        echo "Installer path: $INSTALLER_PATH"
+        echo "Installer name: $INSTALLER_NAME"
+
+

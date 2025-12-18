@@ -1,0 +1,184 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: sign-windows-installer
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to sign a Windows NSIS installer.
+    
+    This task:
+    - SSHs to the Windows signing VM
+    - Calls sign_windows.bat script with installer path
+    - Script handles: sign installer, oras push
+    - Returns signed installer pullspec
+    
+    Part of the Windows signing pipeline: sign-windows-binaries -> create-windows-installer -> sign-windows-installer
+  params:
+    - name: installer_path
+      type: string
+      description: Path to the unsigned installer on Windows VM (from create-windows-installer)
+    - name: component_name
+      type: string
+      description: Name of the component being signed
+    - name: outputRegistry
+      type: string
+      description: Registry to push signed installer to
+      default: quay.io/redhat-pending
+    - name: quaySecret
+      type: string
+      description: Secret containing Quay credentials for oras push
+      default: quay-credentials
+    - name: windowsCredentials
+      type: string
+      description: Secret containing Windows host credentials
+      default: windows-credentials
+    - name: windowsSSHKey
+      type: string
+      description: Secret containing SSH private key for Windows host
+      default: windows-ssh-key
+    - name: signerScriptPath
+      type: string
+      description: Path to sign_windows.bat on the Windows VM
+      default: "C:\\tools\\sign_windows.bat"
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: result
+      description: Success if the task succeeds, the error otherwise
+    - name: signed_installer_pullspec
+      description: Full pullspec for the signed installer artifact
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: quay-secret
+      secret:
+        secretName: $(params.quaySecret)
+        defaultMode: 0444
+    - name: windows-credentials
+      secret:
+        secretName: $(params.windowsCredentials)
+        defaultMode: 0444
+    - name: windows-ssh-key
+      secret:
+        secretName: $(params.windowsSSHKey)
+        defaultMode: 0400
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    securityContext:
+      runAsUser: 1001
+    volumeMounts:
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+
+  steps:
+    - name: sign-installer
+      image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
+      computeResources:
+        limits:
+          memory: 256Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      volumeMounts:
+        - name: workdir
+          mountPath: /workdir
+        - name: quay-secret
+          mountPath: /mnt/quay-secret
+        - name: windows-credentials
+          mountPath: /mnt/windows-credentials
+        - name: windows-ssh-key
+          mountPath: /mnt/windows-ssh-key
+      env:
+        - name: INSTALLER_PATH
+          value: "$(params.installer_path)"
+        - name: COMPONENT_NAME
+          value: "$(params.component_name)"
+        - name: OUTPUT_REGISTRY
+          value: "$(params.outputRegistry)"
+        - name: SIGNER_SCRIPT
+          value: "$(params.signerScriptPath)"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        # Load secrets
+        WIN_HOST=$(cat /mnt/windows-credentials/host)
+        WIN_USER=$(cat /mnt/windows-credentials/username)
+        WIN_CERT_THUMBPRINT=$(cat /mnt/windows-credentials/cert_thumbprint)
+        QUAY_USER=$(cat /mnt/quay-secret/username)
+        QUAY_PASS=$(cat /mnt/quay-secret/password)
+
+        set -x
+
+        STDERR_FILE=/tmp/stderr.txt
+        OUTPUT_FILE=/tmp/signer_output.txt
+
+        exitfunc() {
+            local err=$1
+            local line=$2
+            local command="$3"
+            if [ "$err" -eq 0 ] ; then
+                echo -n "Success" > "$(results.result.path)"
+            else
+                echo "$0: ERROR '$command' failed at line $line - exited with status $err" \
+                  > "$(results.result.path)"
+                if [ -f "$STDERR_FILE" ] ; then
+                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                fi
+            fi
+            exit 0
+        }
+        trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
+
+        # Setup SSH
+        mkdir -p ~/.ssh
+        cp /mnt/windows-ssh-key/ssh-privatekey ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        SSH_CMD="ssh $SSH_OPTS ${WIN_USER}@${WIN_HOST}"
+
+        echo "=== Calling sign_windows.bat sign-installer ==="
+        echo "Installer path: $INSTALLER_PATH"
+        echo "Output registry: $OUTPUT_REGISTRY"
+
+        # Call the signer script on the Windows VM
+        # Script handles: sign installer, oras push
+        $SSH_CMD "
+            set CERT_THUMBPRINT=$WIN_CERT_THUMBPRINT
+            set QUAY_USER=$QUAY_USER
+            set QUAY_PASS=$QUAY_PASS
+            
+            $SIGNER_SCRIPT sign-installer ^
+                --installer-path \"$INSTALLER_PATH\" ^
+                --output-registry \"$OUTPUT_REGISTRY\" ^
+                --component \"$COMPONENT_NAME\"
+        " 2>"$STDERR_FILE" | tee "$OUTPUT_FILE"
+
+        # Parse output - script outputs signed artifact pullspec on last line
+        SIGNED_PULLSPEC=$(tail -1 "$OUTPUT_FILE" | tr -d '\r\n')
+
+        echo ""
+        echo "=== Sign-windows-installer complete ==="
+        echo "Signed installer pullspec: $SIGNED_PULLSPEC"
+
+        # Write results
+        echo -n "$SIGNED_PULLSPEC" > "$(results.signed_installer_pullspec.path)"
+
