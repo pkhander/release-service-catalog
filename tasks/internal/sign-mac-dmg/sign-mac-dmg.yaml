@@ -1,0 +1,202 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: sign-mac-dmg
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to sign, notarize, and staple a macOS DMG installer.
+    
+    This task:
+    - SSHs to the Mac signing VM
+    - Calls remote_mac_signer.py script with DMG path
+    - Script handles: sign, notarize, staple, oras push
+    - Returns signed DMG pullspec
+    
+    Part of the mac signing pipeline: sign-mac-app -> create-mac-dmg -> sign-mac-dmg
+  params:
+    - name: dmg_path
+      type: string
+      description: Path to the unsigned DMG on the Mac VM (from create-mac-dmg)
+    - name: component_name
+      type: string
+      description: Name of the component being signed
+    - name: outputRegistry
+      type: string
+      description: Registry to push signed DMG to
+      default: quay.io/redhat-pending
+    - name: quaySecret
+      type: string
+      description: Secret containing Quay credentials for oras push
+      default: quay-credentials
+    - name: macHostCredentials
+      type: string
+      description: Secret containing Mac host username and host
+      default: mac-host-credentials
+    - name: macSigningCredentials
+      type: string
+      description: Secret containing Mac signing credentials (keychain, Apple ID, etc.)
+      default: mac-signing-credentials
+    - name: macSSHKey
+      type: string
+      description: Secret containing SSH private key for Mac host
+      default: mac-ssh-key
+    - name: signerScriptPath
+      type: string
+      description: Path to remote_mac_signer.py on the Mac VM
+      default: "/usr/local/bin/remote_mac_signer.py"
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: result
+      description: Success if the task succeeds, the error otherwise
+    - name: signed_dmg_pullspec
+      description: Full pullspec for the signed DMG artifact
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: quay-secret
+      secret:
+        secretName: $(params.quaySecret)
+        defaultMode: 0444
+    - name: mac-host-credentials
+      secret:
+        secretName: $(params.macHostCredentials)
+        defaultMode: 0444
+    - name: mac-signing-credentials
+      secret:
+        secretName: $(params.macSigningCredentials)
+        defaultMode: 0444
+    - name: mac-ssh-key
+      secret:
+        secretName: $(params.macSSHKey)
+        defaultMode: 0400
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    securityContext:
+      runAsUser: 1001
+    volumeMounts:
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+
+  steps:
+    - name: sign-notarize-dmg
+      image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
+      computeResources:
+        limits:
+          memory: 256Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      volumeMounts:
+        - name: workdir
+          mountPath: /workdir
+        - name: quay-secret
+          mountPath: /mnt/quay-secret
+        - name: mac-host-credentials
+          mountPath: /mnt/mac-host-credentials
+        - name: mac-signing-credentials
+          mountPath: /mnt/mac-signing-credentials
+        - name: mac-ssh-key
+          mountPath: /mnt/mac-ssh-key
+      env:
+        - name: DMG_PATH
+          value: "$(params.dmg_path)"
+        - name: COMPONENT_NAME
+          value: "$(params.component_name)"
+        - name: OUTPUT_REGISTRY
+          value: "$(params.outputRegistry)"
+        - name: SIGNER_SCRIPT
+          value: "$(params.signerScriptPath)"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        # Load secrets
+        MAC_HOST=$(cat /mnt/mac-host-credentials/host)
+        MAC_USER=$(cat /mnt/mac-host-credentials/username)
+        CSC_NAME=$(cat /mnt/mac-signing-credentials/csc_name)
+        CSC_KEY_PASSWORD=$(cat /mnt/mac-signing-credentials/keychain_password)
+        APPLE_ID=$(cat /mnt/mac-signing-credentials/apple_id)
+        APPLE_APP_SPECIFIC_PASSWORD=$(cat /mnt/mac-signing-credentials/apple_app_specific_password)
+        APPLE_TEAM_ID=$(cat /mnt/mac-signing-credentials/apple_team_id)
+        QUAY_USER=$(cat /mnt/quay-secret/username)
+        QUAY_PASS=$(cat /mnt/quay-secret/password)
+
+        set -x
+
+        STDERR_FILE=/tmp/stderr.txt
+        OUTPUT_FILE=/tmp/signer_output.txt
+
+        exitfunc() {
+            local err=$1
+            local line=$2
+            local command="$3"
+            if [ "$err" -eq 0 ] ; then
+                echo -n "Success" > "$(results.result.path)"
+            else
+                echo "$0: ERROR '$command' failed at line $line - exited with status $err" \
+                  > "$(results.result.path)"
+                if [ -f "$STDERR_FILE" ] ; then
+                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                fi
+            fi
+            exit 0
+        }
+        trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
+
+        # Setup SSH
+        mkdir -p ~/.ssh
+        cp /mnt/mac-ssh-key/ssh-privatekey ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        SSH_CMD="ssh $SSH_OPTS ${MAC_USER}@${MAC_HOST}"
+
+        echo "=== Calling remote_mac_signer.py sign-dmg ==="
+        echo "DMG path: $DMG_PATH"
+        echo "Output registry: $OUTPUT_REGISTRY"
+
+        # Call the signer script on the Mac VM
+        # Script handles: sign, notarize, staple, oras push
+        $SSH_CMD "
+            export CSC_NAME='$CSC_NAME'
+            export CSC_KEY_PASSWORD='$CSC_KEY_PASSWORD'
+            export APPLE_ID='$APPLE_ID'
+            export APPLE_APP_SPECIFIC_PASSWORD='$APPLE_APP_SPECIFIC_PASSWORD'
+            export APPLE_TEAM_ID='$APPLE_TEAM_ID'
+            export QUAY_USER='$QUAY_USER'
+            export QUAY_PASS='$QUAY_PASS'
+            
+            $SIGNER_SCRIPT sign-dmg \
+                --dmg-path '$DMG_PATH' \
+                --output-registry '$OUTPUT_REGISTRY' \
+                --component '$COMPONENT_NAME'
+        " 2>"$STDERR_FILE" | tee "$OUTPUT_FILE"
+
+        # Parse output - script outputs signed artifact pullspec on last line
+        SIGNED_PULLSPEC=$(tail -1 "$OUTPUT_FILE" | tr -d '\r\n')
+
+        echo ""
+        echo "=== Sign-mac-dmg complete ==="
+        echo "Signed DMG pullspec: $SIGNED_PULLSPEC"
+
+        # Write results
+        echo -n "$SIGNED_PULLSPEC" > "$(results.signed_dmg_pullspec.path)"
+

@@ -1,0 +1,233 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: create-mac-dmg
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to create macOS DMG installer from a signed .app bundle.
+    
+    This task:
+    - SSHs to the Mac VM (same as sign-mac-app for now)
+    - Uses electron-builder to create DMG from signed .app
+    - Leaves unsigned DMG on disk for sign-mac-dmg task
+    
+    Part of the mac signing pipeline: sign-mac-app -> create-mac-dmg -> sign-mac-dmg
+  params:
+    - name: signed_app_path
+      type: string
+      description: Path to the signed .app on the Mac VM (from sign-mac-app)
+    - name: component_name
+      type: string
+      description: Name of the component being processed
+    - name: macHostCredentials
+      type: string
+      description: Secret containing Mac host username and host
+      default: mac-host-credentials
+    - name: macSSHKey
+      type: string
+      description: Secret containing SSH private key for Mac host
+      default: mac-ssh-key
+    - name: workingDir
+      type: string
+      description: Working directory on the Mac VM
+      default: "~/signing/work"
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: result
+      description: Success if the task succeeds, the error otherwise
+    - name: dmg_path
+      description: Path to the created DMG on the Mac VM
+    - name: dmg_name
+      description: Name of the DMG file (e.g., "My App-1.0.0-arm64.dmg")
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: mac-host-credentials
+      secret:
+        secretName: $(params.macHostCredentials)
+        defaultMode: 0444
+    - name: mac-ssh-key
+      secret:
+        secretName: $(params.macSSHKey)
+        defaultMode: 0400
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    securityContext:
+      runAsUser: 1001
+    volumeMounts:
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+
+  steps:
+    - name: create-dmg
+      image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
+      computeResources:
+        limits:
+          memory: 256Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      volumeMounts:
+        - name: workdir
+          mountPath: /workdir
+        - name: mac-host-credentials
+          mountPath: /mnt/mac-host-credentials
+        - name: mac-ssh-key
+          mountPath: /mnt/mac-ssh-key
+      env:
+        - name: SIGNED_APP_PATH
+          value: "$(params.signed_app_path)"
+        - name: COMPONENT_NAME
+          value: "$(params.component_name)"
+        - name: WORKING_DIR
+          value: "$(params.workingDir)"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        # Load secrets
+        MAC_HOST=$(cat /mnt/mac-host-credentials/host)
+        MAC_USER=$(cat /mnt/mac-host-credentials/username)
+
+        set -x
+
+        STDERR_FILE=/tmp/stderr.txt
+
+        exitfunc() {
+            local err=$1
+            local line=$2
+            local command="$3"
+            if [ "$err" -eq 0 ] ; then
+                echo -n "Success" > "$(results.result.path)"
+            else
+                echo "$0: ERROR '$command' failed at line $line - exited with status $err" \
+                  > "$(results.result.path)"
+                if [ -f "$STDERR_FILE" ] ; then
+                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                fi
+            fi
+            exit 0
+        }
+        trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
+
+        # Setup SSH
+        mkdir -p ~/.ssh
+        cp /mnt/mac-ssh-key/ssh-privatekey ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        SSH_CMD="ssh $SSH_OPTS ${MAC_USER}@${MAC_HOST}"
+
+        REMOTE_WORK_DIR="${WORKING_DIR}/${COMPONENT_NAME}"
+
+        echo "=== Step 1: Verify signed .app exists ==="
+        $SSH_CMD "
+            if [ ! -d '$SIGNED_APP_PATH' ]; then
+                echo 'ERROR: Signed .app not found at: $SIGNED_APP_PATH'
+                exit 1
+            fi
+            echo 'Found signed .app: $SIGNED_APP_PATH'
+            codesign --verify --deep --strict '$SIGNED_APP_PATH' || echo 'Warning: Signature verification failed'
+        " 2>"$STDERR_FILE"
+
+        echo "=== Step 2: Find upstream directory with package.json ==="
+        # The upstream directory contains package.json needed by electron-builder
+        UPSTREAM_DIR=$($SSH_CMD "find $REMOTE_WORK_DIR -name 'package.json' -type f | head -1 | xargs dirname" | tr -d '\r\n')
+        
+        if [ -z "$UPSTREAM_DIR" ]; then
+            echo "ERROR: Could not find package.json in work directory"
+            exit 1
+        fi
+        echo "UPSTREAM_DIR: $UPSTREAM_DIR"
+
+        echo "=== Step 3: Create DMG with electron-builder ==="
+        # Get the relative path from upstream to .app
+        APP_NAME=$(basename "$SIGNED_APP_PATH")
+        
+        $SSH_CMD "
+            set -e
+            cd '$UPSTREAM_DIR'
+            
+            # Get the .app directory relative to upstream
+            APP_DIR=\$(dirname '$SIGNED_APP_PATH')
+            APP_RELATIVE_PATH=\$(realpath --relative-to='$UPSTREAM_DIR' \"\$APP_DIR\")
+            
+            echo 'APP_NAME: $APP_NAME'
+            echo 'APP_DIR: '\$APP_DIR
+            echo 'APP_RELATIVE_PATH: '\$APP_RELATIVE_PATH
+            
+            # Set temp directory to avoid permission issues
+            export TMPDIR=/tmp
+            
+            # Create minimal DMG config if needed
+            # electron-builder needs dmg config for background, icon positioning, etc.
+            if [ ! -f dmg-config.json ]; then
+                echo 'Creating minimal dmg-config.json...'
+                cat > dmg-config.json << 'DMGEOF'
+        {
+          \"dmg\": {
+            \"contents\": [
+              { \"x\": 130, \"y\": 220 },
+              { \"x\": 410, \"y\": 220, \"type\": \"link\", \"path\": \"/Applications\" }
+            ],
+            \"window\": {
+              \"width\": 540,
+              \"height\": 400
+            }
+          },
+          \"mac\": {
+            \"identity\": null
+          }
+        }
+        DMGEOF
+            fi
+            
+            # Run electron-builder to create DMG
+            # --prepackaged points to the directory containing the signed .app
+            # Disable code signing (already signed)
+            echo 'Running electron-builder...'
+            npx electron-builder --mac dmg --arm64 \\
+                --prepackaged \"\$APP_RELATIVE_PATH/$APP_NAME\" \\
+                --config dmg-config.json \\
+                -c.mac.identity=null
+            
+            echo ''
+            echo 'DMG created:'
+            ls -lh dist/*.dmg
+        " 2>>"$STDERR_FILE"
+
+        echo "=== Step 4: Get DMG path ==="
+        DMG_NAME=$($SSH_CMD "ls -1 '$UPSTREAM_DIR/dist/'*.dmg | head -1 | xargs basename" | tr -d '\r\n')
+        DMG_PATH="${UPSTREAM_DIR}/dist/${DMG_NAME}"
+        
+        echo "DMG_NAME: $DMG_NAME"
+        echo "DMG_PATH: $DMG_PATH"
+
+        # Write results
+        echo -n "$DMG_PATH" > "$(results.dmg_path.path)"
+        echo -n "$DMG_NAME" > "$(results.dmg_name.path)"
+
+        echo ""
+        echo "=== Create-mac-dmg complete ==="
+        echo "DMG path: $DMG_PATH"
+        echo "DMG name: $DMG_NAME"
+
+
