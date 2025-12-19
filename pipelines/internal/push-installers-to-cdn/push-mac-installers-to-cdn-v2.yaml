@@ -1,0 +1,220 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: push-mac-installers-to-cdn-v2
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.1.0"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton Pipeline to sign macOS .app, create DMG, notarize, and push to CDN.
+    
+    Simplified v2 flow using combined sign-mac-installer task:
+    1. extract-installer-payload - Inspect OCI, return mac_artifacts
+    2. sign-mac-installer - Combined: sign .app + create DMG + notarize (all on Mac VM)
+    3. generate-checksums - Pull signed DMGs, generate SHA256, GPG sign
+    4. push-to-cdn - Push to Exodus/Pulp/CGW
+  params:
+    - name: snapshot_json
+      type: string
+      description: String containing a JSON representation of the snapshot spec
+    - name: exodusGwSecret
+      type: string
+      description: Env specific secret containing the Exodus Gateway configs
+    - name: exodusGwEnv
+      type: string
+      description: Environment to use in the Exodus Gateway. Options are [live, pre]
+    - name: pulpSecret
+      type: string
+      description: Env specific secret containing the rhsm-pulp credentials
+    - name: udcacheSecret
+      type: string
+      description: Env specific secret containing the udcache credentials
+    - name: cgwHostname
+      type: string
+      description: The hostname of the content-gateway to publish the metadata to
+      default: https://developers.redhat.com/content-gateway/rest/admin
+    - name: cgwSecret
+      type: string
+      description: Env specific secret containing the content gateway credentials
+    - name: author
+      type: string
+      description: Author taken from Release to be used for checksum signing
+    - name: signingKeyName
+      type: string
+      description: Signing key name to be used for checksum signing
+    - name: taskGitUrl
+      description: The url to the git repo where the release-service-catalog tasks are stored
+      default: https://github.com/konflux-ci/release-service-catalog.git
+      type: string
+    - name: taskGitRevision
+      description: The revision in the taskGitUrl repo to be used
+      type: string
+    - name: quayURL
+      description: Quay URL of the repo where signed content will be pushed
+      type: string
+      default: "quay.io/redhat-pending"
+    # Mac host params
+    - name: macHostCredentials
+      type: string
+      description: Secret containing Mac host username and host for signing user
+      default: mac-host-credentials
+    - name: macSigningCredentials
+      type: string
+      description: Secret containing Mac signing credentials (keychain, Apple ID, etc.)
+      default: mac-signing-credentials
+    - name: macSSHKey
+      type: string
+      description: Secret containing SSH private key for macos-signing user
+      default: mac-ssh-key
+    - name: dmgCreatorHostCredentials
+      type: string
+      description: Secret containing Mac host username and host for dmg-creator user
+      default: dmg-creator-host-credentials
+    - name: dmgCreatorSSHKey
+      type: string
+      description: Secret containing SSH private key for dmg-creator user
+      default: dmg-creator-ssh-key
+    # Checksum signing params
+    - name: checksumCredentials
+      type: string
+      description: Secret containing keytab, user, host, fingerprint for checksum signing
+      default: checksum-credentials
+  workspaces:
+    - name: data
+      description: Workspace for sharing data between tasks
+  results:
+    - name: result
+      value: $(tasks.push-to-cdn.results.result)
+
+  tasks:
+    # =========================================================================
+    # Step 1: Extract installer payload - inspect OCI, return mac_artifacts
+    # =========================================================================
+    - name: extract-installer-payload
+      timeout: "30m0s"
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: tasks/internal/extract-installer-payload/extract-installer-payload.yaml
+      params:
+        - name: snapshot_json
+          value: $(params.snapshot_json)
+
+    # =========================================================================
+    # Step 2: Sign Mac installer (combined task)
+    #   - Sign .app on Mac VM
+    #   - Create DMG with electron-builder (as dmg-creator user)
+    #   - Sign, notarize, staple DMG (as macos-signing user)
+    #   - Push signed DMG to Quay
+    # =========================================================================
+    - name: sign-mac-installer
+      timeout: "2h00m0s"
+      when:
+        - input: $(tasks.extract-installer-payload.results.has_mac_content)
+          operator: in
+          values: ["true"]
+      runAfter:
+        - extract-installer-payload
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: tasks/internal/sign-mac-installer/sign-mac-installer.yaml
+      params:
+        - name: mac_artifacts
+          value: $(tasks.extract-installer-payload.results.mac_artifacts)
+        - name: outputRegistry
+          value: $(params.quayURL)
+        - name: quaySecret
+          value: quay-credentials
+        - name: macHostCredentials
+          value: $(params.macHostCredentials)
+        - name: macSigningCredentials
+          value: $(params.macSigningCredentials)
+        - name: macSSHKey
+          value: $(params.macSSHKey)
+        - name: dmgCreatorHostCredentials
+          value: $(params.dmgCreatorHostCredentials)
+        - name: dmgCreatorSSHKey
+          value: $(params.dmgCreatorSSHKey)
+
+    # =========================================================================
+    # Step 3: Generate checksums
+    #   - Pull signed DMGs from Quay
+    #   - Generate SHA256 checksums per component
+    #   - GPG sign checksums on checksum host
+    # =========================================================================
+    - name: generate-checksums
+      timeout: "30m0s"
+      runAfter:
+        - sign-mac-installer
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: tasks/internal/generate-checksums/generate-checksums.yaml
+      params:
+        - name: signed_dmgs
+          value: $(tasks.sign-mac-installer.results.signed_dmgs)
+        - name: signed_installers
+          value: "[]"
+        - name: author
+          value: $(params.author)
+        - name: signingKeyName
+          value: $(params.signingKeyName)
+        - name: checksumCredentials
+          value: $(params.checksumCredentials)
+      workspaces:
+        - name: data
+          workspace: data
+
+    # =========================================================================
+    # Step 4: Push to CDN
+    #   - Push artifacts to Exodus CDN, Pulp, CGW
+    # =========================================================================
+    - name: push-to-cdn
+      timeout: "4h00m0s"
+      runAfter:
+        - generate-checksums
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: tasks/internal/push-to-cdn/push-to-cdn.yaml
+      params:
+        - name: snapshot_json
+          value: $(params.snapshot_json)
+        - name: exodusGwSecret
+          value: $(params.exodusGwSecret)
+        - name: exodusGwEnv
+          value: $(params.exodusGwEnv)
+        - name: pulpSecret
+          value: $(params.pulpSecret)
+        - name: udcacheSecret
+          value: $(params.udcacheSecret)
+        - name: cgwHostname
+          value: $(params.cgwHostname)
+        - name: cgwSecret
+          value: $(params.cgwSecret)
+      workspaces:
+        - name: data
+          workspace: data

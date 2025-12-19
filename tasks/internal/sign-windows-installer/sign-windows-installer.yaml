@@ -4,7 +4,7 @@ kind: Task
 metadata:
   name: sign-windows-installer
   annotations:
-    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/pipelines.minVersion: "0.1.0"
     tekton.dev/tags: release
 spec:
   description: |-
@@ -12,26 +12,15 @@ spec:
     
     This task:
     - SSHs to the Windows signing VM
-    - Calls sign_windows.bat script with installer path
-    - Script handles: sign installer, oras push
-    - Returns signed installer pullspec
+    - Runs signtool to sign the installer
+    - Verifies the signature
+    - Returns Windows path to signed installer (for push-to-cdn to SCP)
     
     Part of the Windows signing pipeline: sign-windows-binaries -> create-windows-installer -> sign-windows-installer
   params:
-    - name: installer_path
+    - name: created_installers
       type: string
-      description: Path to the unsigned installer on Windows VM (from create-windows-installer)
-    - name: component_name
-      type: string
-      description: Name of the component being signed
-    - name: outputRegistry
-      type: string
-      description: Registry to push signed installer to
-      default: quay.io/redhat-pending
-    - name: quaySecret
-      type: string
-      description: Secret containing Quay credentials for oras push
-      default: quay-credentials
+      description: JSON array of created installers [{component, arch, win_path, installer_name}] from create-windows-installer
     - name: windowsCredentials
       type: string
       description: Secret containing Windows host credentials
@@ -40,10 +29,6 @@ spec:
       type: string
       description: Secret containing SSH private key for Windows host
       default: windows-ssh-key
-    - name: signerScriptPath
-      type: string
-      description: Path to sign_windows.bat on the Windows VM
-      default: "C:\\tools\\sign_windows.bat"
     - name: caTrustConfigMapName
       type: string
       description: The name of the ConfigMap to read CA bundle data from
@@ -55,15 +40,11 @@ spec:
   results:
     - name: result
       description: Success if the task succeeds, the error otherwise
-    - name: signed_installer_pullspec
-      description: Full pullspec for the signed installer artifact
+    - name: signed_installers
+      description: JSON array of signed installers [{component, arch, win_path, installer_name}]
   volumes:
     - name: workdir
       emptyDir: {}
-    - name: quay-secret
-      secret:
-        secretName: $(params.quaySecret)
-        defaultMode: 0444
     - name: windows-credentials
       secret:
         secretName: $(params.windowsCredentials)
@@ -71,7 +52,7 @@ spec:
     - name: windows-ssh-key
       secret:
         secretName: $(params.windowsSSHKey)
-        defaultMode: 0400
+        defaultMode: 0444
     - name: trusted-ca
       configMap:
         name: $(params.caTrustConfigMapName)
@@ -99,36 +80,26 @@ spec:
       volumeMounts:
         - name: workdir
           mountPath: /workdir
-        - name: quay-secret
-          mountPath: /mnt/quay-secret
         - name: windows-credentials
           mountPath: /mnt/windows-credentials
         - name: windows-ssh-key
           mountPath: /mnt/windows-ssh-key
       env:
-        - name: INSTALLER_PATH
-          value: "$(params.installer_path)"
-        - name: COMPONENT_NAME
-          value: "$(params.component_name)"
-        - name: OUTPUT_REGISTRY
-          value: "$(params.outputRegistry)"
-        - name: SIGNER_SCRIPT
-          value: "$(params.signerScriptPath)"
+        - name: CREATED_INSTALLERS
+          value: "$(params.created_installers)"
       script: |
         #!/usr/bin/env bash
         set -e
+        set -o pipefail
 
         # Load secrets
         WIN_HOST=$(cat /mnt/windows-credentials/host)
         WIN_USER=$(cat /mnt/windows-credentials/username)
         WIN_CERT_THUMBPRINT=$(cat /mnt/windows-credentials/cert_thumbprint)
-        QUAY_USER=$(cat /mnt/quay-secret/username)
-        QUAY_PASS=$(cat /mnt/quay-secret/password)
 
         set -x
 
         STDERR_FILE=/tmp/stderr.txt
-        OUTPUT_FILE=/tmp/signer_output.txt
 
         exitfunc() {
             local err=$1
@@ -143,42 +114,102 @@ spec:
                     grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
                 fi
             fi
-            exit 0
+            exit $err
         }
         trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
 
         # Setup SSH
-        mkdir -p ~/.ssh
-        cp /mnt/windows-ssh-key/ssh-privatekey ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
+        mkdir -p /tekton/home/.ssh
+        cp /mnt/windows-ssh-key/windows_id_rsa /tekton/home/.ssh/id_rsa
+        chmod 600 /tekton/home/.ssh/id_rsa
         
         SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         SSH_CMD="ssh $SSH_OPTS ${WIN_USER}@${WIN_HOST}"
 
-        echo "=== Calling sign_windows.bat sign-installer ==="
-        echo "Installer path: $INSTALLER_PATH"
-        echo "Output registry: $OUTPUT_REGISTRY"
+        # Parse input array
+        INSTALLER_COUNT=$(jq 'length' <<< "$CREATED_INSTALLERS")
+        echo "=== Signing $INSTALLER_COUNT installers ==="
 
-        # Call the signer script on the Windows VM
-        # Script handles: sign installer, oras push
-        $SSH_CMD "
-            set CERT_THUMBPRINT=$WIN_CERT_THUMBPRINT
-            set QUAY_USER=$QUAY_USER
-            set QUAY_PASS=$QUAY_PASS
-            
-            $SIGNER_SCRIPT sign-installer ^
-                --installer-path \"$INSTALLER_PATH\" ^
-                --output-registry \"$OUTPUT_REGISTRY\" ^
-                --component \"$COMPONENT_NAME\"
-        " 2>"$STDERR_FILE" | tee "$OUTPUT_FILE"
+        # Initialize output array
+        SIGNED_INSTALLERS="[]"
 
-        # Parse output - script outputs signed artifact pullspec on last line
-        SIGNED_PULLSPEC=$(tail -1 "$OUTPUT_FILE" | tr -d '\r\n')
+        # Loop over each installer
+        for i in $(seq 0 $((INSTALLER_COUNT - 1))); do
+            INSTALLER=$(jq -c ".[$i]" <<< "$CREATED_INSTALLERS")
+            WIN_PATH=$(jq -r '.win_path' <<< "$INSTALLER")
+            INSTALLER_NAME=$(jq -r '.installer_name' <<< "$INSTALLER")
+            WIN_ARCH=$(jq -r '.arch' <<< "$INSTALLER")
+            COMPONENT_NAME=$(jq -r '.component' <<< "$INSTALLER")
+
+            INSTALLER_PATH="${WIN_PATH}\\dist\\${INSTALLER_NAME}"
+
+            echo ""
+            echo "=== [$((i+1))/$INSTALLER_COUNT] Signing installer for $COMPONENT_NAME ($WIN_ARCH) ==="
+            echo "Installer path: $INSTALLER_PATH"
+
+            # Sign the installer using signtool
+            set +x
+            $SSH_CMD "
+                \$env:CERT_THUMBPRINT = '$WIN_CERT_THUMBPRINT'
+                
+                # Path to signtool (Windows SDK)
+                \$signtool = 'C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\signtool.exe'
+                
+                # Verify installer exists
+                if (-not (Test-Path '$INSTALLER_PATH')) {
+                    Write-Error 'Installer not found at: $INSTALLER_PATH'
+                    exit 1
+                }
+                
+                Write-Host 'Signing installer: $INSTALLER_PATH'
+                Write-Host 'Using certificate thumbprint: $WIN_CERT_THUMBPRINT'
+                
+                # Sign the installer
+                & \$signtool sign /v /sha1 \$env:CERT_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 '$INSTALLER_PATH'
+                
+                if (\$LASTEXITCODE -ne 0) {
+                    Write-Error 'signtool sign failed'
+                    exit 1
+                }
+                
+                Write-Host ''
+                Write-Host 'Verifying signature...'
+                
+                # Verify the signature
+                & \$signtool verify /v /pa '$INSTALLER_PATH'
+                
+                if (\$LASTEXITCODE -ne 0) {
+                    Write-Error 'signtool verify failed'
+                    exit 1
+                }
+                
+                Write-Host ''
+                Write-Host 'Installer signed successfully!'
+                Get-Item '$INSTALLER_PATH' | Format-Table Name, Length, LastWriteTime
+            " 2>&1 | tee /tmp/sign_output.txt
+            set -x
+
+            # Check for errors
+            if grep -qi "error\|failed" /tmp/sign_output.txt | grep -vi "0 errors"; then
+                echo "WARNING: Possible signing errors detected"
+            fi
+
+            echo "Signed installer at: $INSTALLER_PATH"
+
+            # Add to output array - store Windows path for push-to-cdn to SCP
+            SIGNED_INSTALLERS=$(jq -c \
+                --arg component "$COMPONENT_NAME" \
+                --arg arch "$WIN_ARCH" \
+                --arg win_path "$WIN_PATH" \
+                --arg installer_name "$INSTALLER_NAME" \
+                '. + [{component: $component, arch: $arch, win_path: $win_path, installer_name: $installer_name}]' \
+                <<< "$SIGNED_INSTALLERS")
+        done
 
         echo ""
         echo "=== Sign-windows-installer complete ==="
-        echo "Signed installer pullspec: $SIGNED_PULLSPEC"
+        echo "Signed $INSTALLER_COUNT installers:"
+        jq '.' <<< "$SIGNED_INSTALLERS"
 
         # Write results
-        echo -n "$SIGNED_PULLSPEC" > "$(results.signed_installer_pullspec.path)"
-
+        echo -n "$SIGNED_INSTALLERS" > "$(results.signed_installers.path)"

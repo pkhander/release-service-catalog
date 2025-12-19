@@ -4,7 +4,7 @@ kind: Task
 metadata:
   name: sign-mac-app
   annotations:
-    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/pipelines.minVersion: "0.1.0"
     tekton.dev/tags: release
 spec:
   description: |-
@@ -12,22 +12,22 @@ spec:
     
     This task:
     - SSHs to the Mac signing VM
-    - Calls remote_mac_signer.py script with pullspec
+    - Calls mac_signer.py script with pullspec
     - Script handles: oras pull, extract, sign, oras push
     - Returns signed artifact pullspec
     
     Part of the mac signing pipeline: sign-mac-app -> create-mac-dmg -> sign-mac-dmg
   params:
-    - name: mac_pullspec
+    - name: mac_artifacts
       type: string
-      description: OCI pullspec for the macOS artifact to sign
-    - name: component_name
+      description: JSON array of macOS artifacts [{arch, pullspec, component}]
+    - name: pipelineRunUid
       type: string
-      description: Name of the component being signed
+      description: Unique identifier for this pipeline run (used in push tag)
     - name: outputRegistry
       type: string
       description: Registry to push signed artifacts to
-      default: quay.io/redhat-pending
+      default: quay.io/konflux-artifacts
     - name: quaySecret
       type: string
       description: Secret containing Quay credentials for oras pull/push
@@ -46,8 +46,8 @@ spec:
       default: mac-ssh-key
     - name: signerScriptPath
       type: string
-      description: Path to remote_mac_signer.py on the Mac VM
-      default: "/usr/local/bin/remote_mac_signer.py"
+      description: Path to mac_signer.py on the Mac VM
+      default: "/Users/konflux-release-signing-sa/mac_signer/mac_signer.py"
     - name: caTrustConfigMapName
       type: string
       description: The name of the ConfigMap to read CA bundle data from
@@ -59,10 +59,8 @@ spec:
   results:
     - name: result
       description: Success if the task succeeds, the error otherwise
-    - name: signed_app_pullspec
-      description: OCI pullspec of the signed .app artifact
-    - name: signed_app_path
-      description: Path to the signed .app on the Mac VM (for create-mac-dmg)
+    - name: signed_apps
+      description: JSON array of signed apps [{component, arch, pullspec}]
   volumes:
     - name: workdir
       emptyDir: {}
@@ -81,7 +79,11 @@ spec:
     - name: mac-ssh-key
       secret:
         secretName: $(params.macSSHKey)
-        defaultMode: 0400
+        defaultMode: 0444
+    - name: redhat-workloads-token
+      secret:
+        secretName: redhat-workloads-token
+        defaultMode: 0444
     - name: trusted-ca
       configMap:
         name: $(params.caTrustConfigMapName)
@@ -117,31 +119,41 @@ spec:
           mountPath: /mnt/mac-signing-credentials
         - name: mac-ssh-key
           mountPath: /mnt/mac-ssh-key
+        - name: redhat-workloads-token
+          mountPath: /mnt/redhat-workloads-token
       env:
-        - name: MAC_PULLSPEC
-          value: "$(params.mac_pullspec)"
-        - name: COMPONENT_NAME
-          value: "$(params.component_name)"
+        - name: MAC_ARTIFACTS
+          value: "$(params.mac_artifacts)"
         - name: OUTPUT_REGISTRY
           value: "$(params.outputRegistry)"
         - name: SIGNER_SCRIPT
           value: "$(params.signerScriptPath)"
+        - name: PIPELINE_RUN_UID
+          value: "$(params.pipelineRunUid)"
       script: |
         #!/usr/bin/env bash
         set -e
+        set -o pipefail
 
         # Load secrets
         MAC_HOST=$(cat /mnt/mac-host-credentials/host)
         MAC_USER=$(cat /mnt/mac-host-credentials/username)
         CSC_NAME=$(cat /mnt/mac-signing-credentials/csc_name)
         CSC_KEY_PASSWORD=$(cat /mnt/mac-signing-credentials/keychain_password)
-        QUAY_USER=$(cat /mnt/quay-secret/username)
-        QUAY_PASS=$(cat /mnt/quay-secret/password)
 
         set -x
 
         STDERR_FILE=/tmp/stderr.txt
         OUTPUT_FILE=/tmp/signer_output.txt
+
+        # Validate we have artifacts
+        ARTIFACT_COUNT=$(jq 'length' <<< "$MAC_ARTIFACTS")
+        if [ "$ARTIFACT_COUNT" -eq 0 ]; then
+            echo "ERROR: No macOS artifacts found in mac_artifacts array"
+            exit 1
+        fi
+        
+        echo "Found $ARTIFACT_COUNT macOS artifact(s) to sign"
 
         exitfunc() {
             local err=$1
@@ -152,52 +164,122 @@ spec:
             else
                 echo "$0: ERROR '$command' failed at line $line - exited with status $err" \
                   > "$(results.result.path)"
-                if [ -f "$STDERR_FILE" ] ; then
-                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                if [ -f "$OUTPUT_FILE" ] ; then
+                    grep -v "^\+" "$OUTPUT_FILE" | tail -c 512 | tee -a "$(results.result.path)"
                 fi
             fi
-            exit 0
+            exit $err
         }
         trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
 
         # Setup SSH
         mkdir -p ~/.ssh
-        cp /mnt/mac-ssh-key/ssh-privatekey ~/.ssh/id_rsa
+        cp /mnt/mac-ssh-key/mac_id_rsa ~/.ssh/id_rsa
         chmod 600 ~/.ssh/id_rsa
         
         # SSH options
         SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         SSH_CMD="ssh $SSH_OPTS ${MAC_USER}@${MAC_HOST}"
+        SCP_CMD="scp $SSH_OPTS"
 
-        echo "=== Calling remote_mac_signer.py sign-app ==="
-        echo "Pullspec: $MAC_PULLSPEC"
-        echo "Output registry: $OUTPUT_REGISTRY"
+        # Copy pull credentials (dockerconfigjson) to Mac VM for pulling from redhat-user-workloads
+        # Strip surrounding quotes if present (some secrets wrap JSON in quotes)
+        # Disable trace to avoid logging credentials
+        PULL_CONFIG_PATH="/tmp/pull-docker-config.json"
+        PUSH_CONFIG_PATH="/tmp/push-docker-config.json"
+        set +x
+        PULL_CONFIG_CONTENT=$(cat /mnt/redhat-workloads-token/.dockerconfigjson | sed "s/^'//;s/'$//")
+        PUSH_CONFIG_CONTENT=$(cat /mnt/quay-secret/dockerconfigjson | sed "s/^'//;s/'$//")
+        $SSH_CMD "rm -f $PULL_CONFIG_PATH && echo '$PULL_CONFIG_CONTENT' > $PULL_CONFIG_PATH"
+        $SSH_CMD "rm -f $PUSH_CONFIG_PATH && echo '$PUSH_CONFIG_CONTENT' > $PUSH_CONFIG_PATH"
+        set -x
+        echo "Pull credentials copied to Mac VM: $PULL_CONFIG_PATH"
+        echo "Push credentials copied to Mac VM: $PUSH_CONFIG_PATH"
 
-        # Call the signer script on the Mac VM
-        # Script handles: oras pull, extract, sign, oras push
-        $SSH_CMD "
-            export CSC_NAME='$CSC_NAME'
-            export CSC_KEY_PASSWORD='$CSC_KEY_PASSWORD'
-            export QUAY_USER='$QUAY_USER'
-            export QUAY_PASS='$QUAY_PASS'
-            
-            $SIGNER_SCRIPT sign-app \
-                --pullspec '$MAC_PULLSPEC' \
-                --output-registry '$OUTPUT_REGISTRY' \
-                --component '$COMPONENT_NAME'
-        " 2>"$STDERR_FILE" | tee "$OUTPUT_FILE"
+        # Verify remote signer script exists
+        echo "Verifying remote signer script exists at: $SIGNER_SCRIPT"
+        if ! $SSH_CMD "test -f '$SIGNER_SCRIPT'" 2>"$STDERR_FILE"; then
+            echo "ERROR: Remote signer script not found at $SIGNER_SCRIPT on $MAC_HOST"
+            exit 1
+        fi
+        echo "Remote signer script found"
 
-        # Parse output - script outputs signed artifact pullspec on last line
-        SIGNED_PULLSPEC=$(tail -1 "$OUTPUT_FILE" | tr -d '\r\n')
-        
-        # Also get the local app path (for create-mac-dmg task)
-        SIGNED_APP_PATH=$($SSH_CMD "cat /tmp/${COMPONENT_NAME}_app_path 2>/dev/null || echo ''" | tr -d '\r\n')
+        # Initialize output array
+        SIGNED_APPS="[]"
+
+        # Loop over all artifacts
+        for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
+            ARTIFACT=$(jq -c ".[$i]" <<< "$MAC_ARTIFACTS")
+            MAC_PULLSPEC=$(jq -r '.pullspec' <<< "$ARTIFACT")
+            MAC_ARCH=$(jq -r '.arch' <<< "$ARTIFACT")
+            COMPONENT_NAME=$(jq -r '.component' <<< "$ARTIFACT")
+
+            echo ""
+            echo "=== Signing artifact $((i + 1))/$ARTIFACT_COUNT ==="
+            echo "Component: $COMPONENT_NAME"
+            echo "Arch: $MAC_ARCH"
+            echo "Pullspec: $MAC_PULLSPEC"
+
+            # Disable tracing to prevent secrets from appearing in logs
+            set +x
+            $SSH_CMD "
+                export CSC_NAME='$CSC_NAME'
+                export CSC_KEY_PASSWORD='$CSC_KEY_PASSWORD'
+                
+                python3 $SIGNER_SCRIPT sign-app \
+                    --pullspec '$MAC_PULLSPEC' \
+                    --output-registry '$OUTPUT_REGISTRY' \
+                    --component '$COMPONENT_NAME' \
+                    --arch '$MAC_ARCH' \
+                    --pipeline-uid '$PIPELINE_RUN_UID' \
+                    --pull-config '$PULL_CONFIG_PATH' \
+                    --push-config '$PUSH_CONFIG_PATH'
+            " 2>&1 | tee "$OUTPUT_FILE"
+            set -x
+
+            # Log the command (without secrets)
+            echo "python3 $SIGNER_SCRIPT sign-app \\
+                --pullspec '$MAC_PULLSPEC' \\
+                --output-registry '$OUTPUT_REGISTRY' \\
+                --component '$COMPONENT_NAME' \\
+                --arch '$MAC_ARCH' \\
+                --pipeline-uid '$PIPELINE_RUN_UID' \\
+                --pull-config '$PULL_CONFIG_PATH' \\
+                --push-config '$PUSH_CONFIG_PATH'"
+
+            # Parse output - script outputs APP_PATH= and PULLSPEC= lines
+            # Expected format from mac_signer.py:
+            #   APP_PATH=/path/to/signed/App.app
+            #   PULLSPEC=quay.io/registry/image:tag
+            SIGNED_APP_PATH=$(grep "^APP_PATH=" "$OUTPUT_FILE" | cut -d= -f2- | tr -d '\r\n')
+            SIGNED_PULLSPEC=$(grep "^PULLSPEC=" "$OUTPUT_FILE" | cut -d= -f2- | tr -d '\r\n')
+
+            # Fallback: if no APP_PATH= line, try last line for pullspec (backwards compat)
+            if [ -z "$SIGNED_PULLSPEC" ]; then
+                SIGNED_PULLSPEC=$(tail -1 "$OUTPUT_FILE" | tr -d '\r\n')
+            fi
+
+            echo "Signed pullspec: $SIGNED_PULLSPEC"
+
+            # Validate we got pullspec from signer
+            if [ -z "$SIGNED_PULLSPEC" ]; then
+                echo "ERROR: Signer script returned empty pullspec for $COMPONENT_NAME ($MAC_ARCH)"
+                echo "Check that $SIGNER_SCRIPT is working correctly on the Mac VM"
+                exit 1
+            fi
+
+            # Add to output array
+            SIGNED_APPS=$(jq --arg component "$COMPONENT_NAME" \
+                             --arg arch "$MAC_ARCH" \
+                             --arg pullspec "$SIGNED_PULLSPEC" \
+                             '. + [{component: $component, arch: $arch, pullspec: $pullspec}]' \
+                             <<< "$SIGNED_APPS")
+        done
 
         echo ""
         echo "=== Sign-mac-app complete ==="
-        echo "Signed pullspec: $SIGNED_PULLSPEC"
-        echo "Signed app path: $SIGNED_APP_PATH"
+        echo "Signed $ARTIFACT_COUNT artifact(s):"
+        jq '.' <<< "$SIGNED_APPS"
 
         # Write results
-        echo -n "$SIGNED_PULLSPEC" > "$(results.signed_app_pullspec.path)"
-        echo -n "$SIGNED_APP_PATH" > "$(results.signed_app_path.path)"
+        echo -n "$SIGNED_APPS" > "$(results.signed_apps.path)"

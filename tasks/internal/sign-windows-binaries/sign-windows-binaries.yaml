@@ -4,30 +4,26 @@ kind: Task
 metadata:
   name: sign-windows-binaries
   annotations:
-    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/pipelines.minVersion: "0.1.0"
     tekton.dev/tags: release
 spec:
   description: |-
     Tekton task to sign Windows binaries (.exe, .dll, .node) on a remote Windows VM.
     
     This task:
-    - SSHs to the Windows signing VM
-    - Calls sign_windows.bat script with pullspec
-    - Script handles: oras pull, extract, sign all binaries
-    - Returns path to signed binaries for create-windows-installer task
+    - Pulls unsigned artifacts from OCI registry (oras) in Tekton pod
+    - SCPs win-unpacked + nsis-config.json + buildResources to Windows VM
+    - SSHs to Windows VM and runs sign-binaries.bat
+    - Returns Windows path where signed binaries live (for create-windows-installer task)
     
     Part of the Windows signing pipeline: sign-windows-binaries -> create-windows-installer -> sign-windows-installer
   params:
-    - name: win_pullspec
+    - name: win_artifacts
       type: string
-      description: OCI pullspec for the Windows artifact to sign
-    - name: component_name
+      description: JSON array of Windows artifacts [{arch, pullspec, component}]
+    - name: pipelineRunUid
       type: string
-      description: Name of the component being signed
-    - name: outputRegistry
-      type: string
-      description: Registry to push signed artifacts to
-      default: quay.io/redhat-pending
+      description: Unique identifier for this pipeline run (used for work directory)
     - name: quaySecret
       type: string
       description: Secret containing Quay credentials for oras pull
@@ -42,8 +38,8 @@ spec:
       default: windows-ssh-key
     - name: signerScriptPath
       type: string
-      description: Path to sign_windows.bat on the Windows VM
-      default: "C:\\tools\\sign_windows.bat"
+      description: Path to sign-binaries.bat on the Windows VM
+      default: "C:\\tools\\sign-binaries.bat"
     - name: caTrustConfigMapName
       type: string
       description: The name of the ConfigMap to read CA bundle data from
@@ -55,10 +51,8 @@ spec:
   results:
     - name: result
       description: Success if the task succeeds, the error otherwise
-    - name: signed_binaries_pullspec
-      description: OCI pullspec of the signed binaries artifact
-    - name: win_unpacked_path
-      description: Path to the signed win-unpacked directory on the Windows VM (for create-windows-installer)
+    - name: signed_binaries
+      description: JSON array of signed binaries [{component, arch, win_path}]
   volumes:
     - name: workdir
       emptyDir: {}
@@ -73,7 +67,11 @@ spec:
     - name: windows-ssh-key
       secret:
         secretName: $(params.windowsSSHKey)
-        defaultMode: 0400
+        defaultMode: 0444
+    - name: redhat-workloads-token
+      secret:
+        secretName: redhat-workloads-token
+        defaultMode: 0444
     - name: trusted-ca
       configMap:
         name: $(params.caTrustConfigMapName)
@@ -94,43 +92,51 @@ spec:
       image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
       computeResources:
         limits:
-          memory: 256Mi
+          memory: 2Gi
         requests:
-          memory: 256Mi
-          cpu: 100m
+          memory: 1Gi
+          cpu: 200m
       volumeMounts:
         - name: workdir
-          mountPath: /workdir
+          mountPath: /var/workdir
         - name: quay-secret
           mountPath: /mnt/quay-secret
         - name: windows-credentials
           mountPath: /mnt/windows-credentials
         - name: windows-ssh-key
           mountPath: /mnt/windows-ssh-key
+        - name: redhat-workloads-token
+          mountPath: /mnt/redhat-workloads-token
       env:
-        - name: WIN_PULLSPEC
-          value: "$(params.win_pullspec)"
-        - name: COMPONENT_NAME
-          value: "$(params.component_name)"
-        - name: OUTPUT_REGISTRY
-          value: "$(params.outputRegistry)"
+        - name: WIN_ARTIFACTS
+          value: "$(params.win_artifacts)"
         - name: SIGNER_SCRIPT
           value: "$(params.signerScriptPath)"
+        - name: PIPELINE_RUN_UID
+          value: "$(params.pipelineRunUid)"
       script: |
         #!/usr/bin/env bash
         set -e
+        set -o pipefail
 
         # Load secrets
         WIN_HOST=$(cat /mnt/windows-credentials/host)
         WIN_USER=$(cat /mnt/windows-credentials/username)
         WIN_CERT_THUMBPRINT=$(cat /mnt/windows-credentials/cert_thumbprint)
-        QUAY_USER=$(cat /mnt/quay-secret/username)
-        QUAY_PASS=$(cat /mnt/quay-secret/password)
 
         set -x
 
         STDERR_FILE=/tmp/stderr.txt
-        OUTPUT_FILE=/tmp/signer_output.txt
+        LOCAL_WORK_DIR=/var/workdir
+
+        # Validate we have artifacts
+        ARTIFACT_COUNT=$(jq 'length' <<< "$WIN_ARTIFACTS")
+        if [ "$ARTIFACT_COUNT" -eq 0 ]; then
+            echo "ERROR: No Windows artifacts found in win_artifacts array"
+            exit 1
+        fi
+        
+        echo "Found $ARTIFACT_COUNT Windows artifact(s) to sign"
 
         exitfunc() {
             local err=$1
@@ -145,47 +151,181 @@ spec:
                     grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
                 fi
             fi
-            exit 0
+            exit $err
         }
         trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
 
         # Setup SSH
-        mkdir -p ~/.ssh
-        cp /mnt/windows-ssh-key/ssh-privatekey ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
+        mkdir -p /tekton/home/.ssh
+        cp /mnt/windows-ssh-key/windows_id_rsa /tekton/home/.ssh/id_rsa
+        chmod 600 /tekton/home/.ssh/id_rsa
         
         SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         SSH_CMD="ssh $SSH_OPTS ${WIN_USER}@${WIN_HOST}"
+        SCP_CMD="scp $SSH_OPTS"
 
-        echo "=== Calling sign_windows.bat sign-binaries ==="
-        echo "Pullspec: $WIN_PULLSPEC"
-        echo "Output registry: $OUTPUT_REGISTRY"
+        # Setup docker config for oras pull (from redhat-user-workloads)
+        mkdir -p /tekton/home/.docker
+        set +x
+        cat /mnt/redhat-workloads-token/.dockerconfigjson > /tekton/home/.docker/config.json
+        set -x
 
-        # Call the signer script on the Windows VM
-        # Script handles: oras pull, extract, sign all binaries
-        $SSH_CMD "
-            set CERT_THUMBPRINT=$WIN_CERT_THUMBPRINT
-            set QUAY_USER=$QUAY_USER
-            set QUAY_PASS=$QUAY_PASS
+        # Initialize output array
+        SIGNED_BINARIES="[]"
+
+        # Loop over all artifacts
+        for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
+            ARTIFACT=$(jq -c ".[$i]" <<< "$WIN_ARTIFACTS")
+            WIN_PULLSPEC=$(jq -r '.pullspec' <<< "$ARTIFACT")
+            WIN_ARCH=$(jq -r '.arch' <<< "$ARTIFACT")
+            COMPONENT_NAME=$(jq -r '.component' <<< "$ARTIFACT")
+
+            echo ""
+            echo "=== Signing artifact $((i + 1))/$ARTIFACT_COUNT ==="
+            echo "Component: $COMPONENT_NAME"
+            echo "Arch: $WIN_ARCH"
+            echo "Pullspec: $WIN_PULLSPEC"
+
+            # Create local work directory for this artifact
+            ARTIFACT_DIR="${LOCAL_WORK_DIR}/${COMPONENT_NAME}/${WIN_ARCH}"
+            mkdir -p "$ARTIFACT_DIR"
+
+            # Step 1: Pull artifact from OCI registry using oras (in Tekton pod)
+            echo "--- Step 1: Pull artifact from OCI registry ---"
+            cd "$ARTIFACT_DIR"
+            oras pull "$WIN_PULLSPEC" --registry-config /tekton/home/.docker/config.json
             
-            $SIGNER_SCRIPT sign-binaries ^
-                --pullspec \"$WIN_PULLSPEC\" ^
-                --output-registry \"$OUTPUT_REGISTRY\" ^
-                --component \"$COMPONENT_NAME\"
-        " 2>"$STDERR_FILE" | tee "$OUTPUT_FILE"
+            echo "Pulled files:"
+            ls -la
 
-        # Parse output - script outputs signed artifact pullspec on last line
-        SIGNED_PULLSPEC=$(tail -1 "$OUTPUT_FILE" | tr -d '\r\n')
-        
-        # Also get the local win-unpacked path (for create-windows-installer task)
-        WIN_UNPACKED_PATH=$($SSH_CMD "type C:\\temp\\${COMPONENT_NAME}_unpacked_path 2>nul || echo ''" | tr -d '\r\n')
+            # Extract tarballs (same pattern as Mac)
+            echo "--- Extracting tarballs ---"
+            for tarball in *.tar.gz; do
+                if [ -f "$tarball" ]; then
+                    echo "Extracting $tarball..."
+                    tar -xzf "$tarball"
+                fi
+            done
+            
+            echo "Extracted contents:"
+            find . -type d -name "win-unpacked" -o -name "nsis-config.json" -o -name "buildResources" -o -name "package.json" 2>/dev/null | head -20
+
+            # Find win-unpacked directory
+            WIN_UNPACKED_LOCAL=$(find . -type d -name "win-unpacked" | head -1)
+            if [ -z "$WIN_UNPACKED_LOCAL" ]; then
+                echo "ERROR: win-unpacked directory not found after extraction"
+                exit 1
+            fi
+            echo "Found win-unpacked at: $WIN_UNPACKED_LOCAL"
+
+            # Find nsis-config.json
+            NSIS_CONFIG_LOCAL=$(find . -name "nsis-config.json" | head -1)
+            echo "Found nsis-config.json at: ${NSIS_CONFIG_LOCAL:-NOT FOUND}"
+
+            # Find buildResources
+            BUILD_RESOURCES_LOCAL=$(find . -type d -name "buildResources" | head -1)
+            echo "Found buildResources at: ${BUILD_RESOURCES_LOCAL:-NOT FOUND}"
+
+            # Find package.json
+            PACKAGE_JSON_LOCAL=$(find . -name "package.json" | head -1)
+            echo "Found package.json at: ${PACKAGE_JSON_LOCAL:-NOT FOUND}"
+
+            # Step 2: Create payload zip and SCP to Windows VM
+            echo "--- Step 2: Create payload.zip and SCP to Windows VM ---"
+            
+            # Create a staging directory for the payload
+            PAYLOAD_DIR="${ARTIFACT_DIR}/payload"
+            mkdir -p "$PAYLOAD_DIR"
+            
+            # Copy all needed files to payload directory
+            cp -r "$WIN_UNPACKED_LOCAL" "$PAYLOAD_DIR/"
+            if [ -n "$NSIS_CONFIG_LOCAL" ] && [ -f "$NSIS_CONFIG_LOCAL" ]; then
+                cp "$NSIS_CONFIG_LOCAL" "$PAYLOAD_DIR/"
+            fi
+            if [ -n "$BUILD_RESOURCES_LOCAL" ] && [ -d "$BUILD_RESOURCES_LOCAL" ]; then
+                cp -r "$BUILD_RESOURCES_LOCAL" "$PAYLOAD_DIR/"
+            fi
+            if [ -n "$PACKAGE_JSON_LOCAL" ] && [ -f "$PACKAGE_JSON_LOCAL" ]; then
+                cp "$PACKAGE_JSON_LOCAL" "$PAYLOAD_DIR/"
+            fi
+            
+            echo "Payload directory contents:"
+            ls -la "$PAYLOAD_DIR"
+            
+            # Create zip file (faster transfer than many small files via SCP)
+            PAYLOAD_ZIP="${ARTIFACT_DIR}/payload.zip"
+            echo "Creating payload.zip..."
+            cd "$PAYLOAD_DIR"
+            zip -r "$PAYLOAD_ZIP" . -x "*.DS_Store"
+            cd "$ARTIFACT_DIR"
+            ls -lh "$PAYLOAD_ZIP"
+            
+            # Remote paths
+            REMOTE_WORK_DIR="C:\\Users\\${WIN_USER}\\konflux-signing\\${COMPONENT_NAME}\\${PIPELINE_RUN_UID}\\${WIN_ARCH}"
+            REMOTE_WORK_DIR_UNIX="/cygdrive/c/Users/${WIN_USER}/konflux-signing/${COMPONENT_NAME}/${PIPELINE_RUN_UID}/${WIN_ARCH}"
+            
+            # Create remote directory and clean any existing content
+            echo "Creating remote directory: $REMOTE_WORK_DIR"
+            $SSH_CMD "
+                if (Test-Path '$REMOTE_WORK_DIR') { Remove-Item -Recurse -Force '$REMOTE_WORK_DIR' }
+                New-Item -ItemType Directory -Force -Path '$REMOTE_WORK_DIR'
+            " 2>"$STDERR_FILE"
+            
+            # SCP the zip file (single file = much faster than thousands of small files)
+            echo "Uploading payload.zip to Windows VM..."
+            $SCP_CMD "$PAYLOAD_ZIP" "${WIN_USER}@${WIN_HOST}:${REMOTE_WORK_DIR_UNIX}/"
+            
+            # Extract on Windows using PowerShell Expand-Archive
+            echo "Extracting payload.zip on Windows VM..."
+            $SSH_CMD "Expand-Archive -Path '${REMOTE_WORK_DIR}\\payload.zip' -DestinationPath '$REMOTE_WORK_DIR' -Force"
+            
+            # Verify extraction
+            echo "Verifying extraction..."
+            $SSH_CMD "Get-ChildItem '$REMOTE_WORK_DIR'"
+            
+            echo "Files transferred to Windows VM at: $REMOTE_WORK_DIR"
+
+            # Step 3: Run sign-binaries.bat on Windows VM
+            echo "--- Step 3: Sign binaries on Windows VM ---"
+            WIN_UNPACKED_REMOTE="${REMOTE_WORK_DIR}\\win-unpacked"
+            
+            # Run signing (PowerShell)
+            set +x
+            $SSH_CMD "
+                \$env:CERT_THUMBPRINT = '$WIN_CERT_THUMBPRINT'
+                
+                # Run the signing script
+                & '$SIGNER_SCRIPT' '$WIN_UNPACKED_REMOTE'
+                
+                if (\$LASTEXITCODE -ne 0) {
+                    Write-Error 'Signing failed'
+                    exit 1
+                }
+                
+                Write-Host 'Signing complete'
+            " 2>&1 | tee /tmp/sign_output.txt
+            set -x
+
+            # Check for errors in output
+            if grep -qi "error\|failed" /tmp/sign_output.txt; then
+                echo "WARNING: Possible signing errors detected in output"
+            fi
+
+            echo "Signed binaries at: $WIN_UNPACKED_REMOTE"
+
+            # Add to output array - store the Windows path for next task
+            SIGNED_BINARIES=$(jq -c \
+                --arg component "$COMPONENT_NAME" \
+                --arg arch "$WIN_ARCH" \
+                --arg win_path "$REMOTE_WORK_DIR" \
+                '. + [{component: $component, arch: $arch, win_path: $win_path}]' \
+                <<< "$SIGNED_BINARIES")
+        done
 
         echo ""
         echo "=== Sign-windows-binaries complete ==="
-        echo "Signed pullspec: $SIGNED_PULLSPEC"
-        echo "Win-unpacked path: $WIN_UNPACKED_PATH"
+        echo "Signed $ARTIFACT_COUNT artifact(s):"
+        jq '.' <<< "$SIGNED_BINARIES"
 
         # Write results
-        echo -n "$SIGNED_PULLSPEC" > "$(results.signed_binaries_pullspec.path)"
-        echo -n "$WIN_UNPACKED_PATH" > "$(results.win_unpacked_path.path)"
-
+        echo -n "$SIGNED_BINARIES" > "$(results.signed_binaries.path)"

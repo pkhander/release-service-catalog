@@ -4,7 +4,7 @@ kind: Task
 metadata:
   name: create-mac-dmg
   annotations:
-    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/pipelines.minVersion: "0.1.0"
     tekton.dev/tags: release
 spec:
   description: |-
@@ -13,16 +13,24 @@ spec:
     This task:
     - SSHs to the Mac VM (same as sign-mac-app for now)
     - Uses electron-builder to create DMG from signed .app
-    - Leaves unsigned DMG on disk for sign-mac-dmg task
+    - Pushes unsigned DMG to OCI registry via oras
     
     Part of the mac signing pipeline: sign-mac-app -> create-mac-dmg -> sign-mac-dmg
   params:
-    - name: signed_app_path
+    - name: signed_apps
       type: string
-      description: Path to the signed .app on the Mac VM (from sign-mac-app)
-    - name: component_name
+      description: JSON array of signed apps [{component, arch, pullspec}] from sign-mac-app
+    - name: pipelineRunUid
       type: string
-      description: Name of the component being processed
+      description: Unique identifier for this pipeline run (used in push tag)
+    - name: outputRegistry
+      type: string
+      description: Registry to push unsigned DMG artifacts to
+      default: quay.io/konflux-artifacts
+    - name: quaySecret
+      type: string
+      description: Secret containing Quay credentials for oras pull/push
+      default: quay-credentials
     - name: macHostCredentials
       type: string
       description: Secret containing Mac host username and host
@@ -46,13 +54,15 @@ spec:
   results:
     - name: result
       description: Success if the task succeeds, the error otherwise
-    - name: dmg_path
-      description: Path to the created DMG on the Mac VM
-    - name: dmg_name
-      description: Name of the DMG file (e.g., "My App-1.0.0-arm64.dmg")
+    - name: created_dmgs
+      description: JSON array of created DMGs [{component, arch, dmg_path, dmg_name}]
   volumes:
     - name: workdir
       emptyDir: {}
+    - name: quay-secret
+      secret:
+        secretName: $(params.quaySecret)
+        defaultMode: 0444
     - name: mac-host-credentials
       secret:
         secretName: $(params.macHostCredentials)
@@ -60,7 +70,7 @@ spec:
     - name: mac-ssh-key
       secret:
         secretName: $(params.macSSHKey)
-        defaultMode: 0400
+        defaultMode: 0444
     - name: trusted-ca
       configMap:
         name: $(params.caTrustConfigMapName)
@@ -88,17 +98,21 @@ spec:
       volumeMounts:
         - name: workdir
           mountPath: /workdir
+        - name: quay-secret
+          mountPath: /mnt/quay-secret
         - name: mac-host-credentials
           mountPath: /mnt/mac-host-credentials
         - name: mac-ssh-key
           mountPath: /mnt/mac-ssh-key
       env:
-        - name: SIGNED_APP_PATH
-          value: "$(params.signed_app_path)"
-        - name: COMPONENT_NAME
-          value: "$(params.component_name)"
+        - name: SIGNED_APPS
+          value: "$(params.signed_apps)"
         - name: WORKING_DIR
           value: "$(params.workingDir)"
+        - name: OUTPUT_REGISTRY
+          value: "$(params.outputRegistry)"
+        - name: PIPELINE_RUN_UID
+          value: "$(params.pipelineRunUid)"
       script: |
         #!/usr/bin/env bash
         set -e
@@ -110,6 +124,15 @@ spec:
         set -x
 
         STDERR_FILE=/tmp/stderr.txt
+
+        # Validate we have apps
+        APP_COUNT=$(jq 'length' <<< "$SIGNED_APPS")
+        if [ "$APP_COUNT" -eq 0 ]; then
+            echo "ERROR: No signed apps found in signed_apps array"
+            exit 1
+        fi
+        
+        echo "Found $APP_COUNT signed app(s) to create DMGs for"
 
         exitfunc() {
             local err=$1
@@ -124,110 +147,208 @@ spec:
                     grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
                 fi
             fi
-            exit 0
+            exit $err
         }
         trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
 
         # Setup SSH
         mkdir -p ~/.ssh
-        cp /mnt/mac-ssh-key/ssh-privatekey ~/.ssh/id_rsa
+        cp /mnt/mac-ssh-key/mac_id_rsa ~/.ssh/id_rsa
         chmod 600 ~/.ssh/id_rsa
         
         SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         SSH_CMD="ssh $SSH_OPTS ${MAC_USER}@${MAC_HOST}"
 
-        REMOTE_WORK_DIR="${WORKING_DIR}/${COMPONENT_NAME}"
+        # Copy quay credentials to Mac VM for pulling signed artifacts
+        REGISTRY_CONFIG_PATH="/tmp/registry-config.json"
+        set +x
+        REGISTRY_CONFIG_CONTENT=$(cat /mnt/quay-secret/dockerconfigjson | sed "s/^'//;s/'$//")
+        $SSH_CMD "rm -f $REGISTRY_CONFIG_PATH && echo '$REGISTRY_CONFIG_CONTENT' > $REGISTRY_CONFIG_PATH"
+        set -x
+        echo "Registry credentials copied to Mac VM: $REGISTRY_CONFIG_PATH"
 
-        echo "=== Step 1: Verify signed .app exists ==="
-        $SSH_CMD "
-            if [ ! -d '$SIGNED_APP_PATH' ]; then
-                echo 'ERROR: Signed .app not found at: $SIGNED_APP_PATH'
+        # Initialize output array
+        CREATED_DMGS="[]"
+
+        # Loop over all signed apps
+        for i in $(seq 0 $((APP_COUNT - 1))); do
+            APP=$(jq -c ".[$i]" <<< "$SIGNED_APPS")
+            COMPONENT_NAME=$(jq -r '.component' <<< "$APP")
+            ARCH=$(jq -r '.arch' <<< "$APP")
+            PULLSPEC=$(jq -r '.pullspec' <<< "$APP")
+
+            echo ""
+            echo "=== Creating DMG $((i + 1))/$APP_COUNT ==="
+            echo "Component: $COMPONENT_NAME"
+            echo "Arch: $ARCH"
+            echo "Pullspec: $PULLSPEC"
+
+            # Working directory structure: /Users/{user}/konflux-installer-pipeline/{component}/{pipeline-uid}/{arch}
+            REMOTE_WORK_DIR="/Users/${MAC_USER}/konflux-installer-pipeline/${COMPONENT_NAME}/${PIPELINE_RUN_UID}/${ARCH}"
+
+            echo "--- Pull signed .app from registry ---"
+            PULL_OUTPUT=$($SSH_CMD "
+                set -e
+                # Clean and create work directory (oras has symlink bug on re-pull)
+                rm -rf '$REMOTE_WORK_DIR/signed_app'
+                mkdir -p '$REMOTE_WORK_DIR/signed_app'
+                cd '$REMOTE_WORK_DIR/signed_app'
+                
+                # Pull signed .app from ORAS
+                # -T allows symlinks (macOS .app bundles contain framework symlinks)
+                /usr/local/bin/oras pull '$PULLSPEC' --registry-config '$REGISTRY_CONFIG_PATH'
+                
+                # Find the .app bundle
+                APP_PATH=\$(find . -maxdepth 1 -name '*.app' -type d | head -1)
+                if [ -z \"\$APP_PATH\" ]; then
+                    echo 'ERROR: No .app found after oras pull' >&2
+                    exit 1
+                fi
+                
+                # Return absolute path
+                echo \"\$(pwd)/\$(basename \"\$APP_PATH\")\"
+            " 2>"$STDERR_FILE")
+            PULL_EXIT_CODE=$?
+
+            if [ $PULL_EXIT_CODE -ne 0 ]; then
+                echo "ERROR: Failed to pull signed .app from registry (exit code: $PULL_EXIT_CODE)"
+                echo "Stderr output:"
+                cat "$STDERR_FILE"
                 exit 1
             fi
-            echo 'Found signed .app: $SIGNED_APP_PATH'
-            codesign --verify --deep --strict '$SIGNED_APP_PATH' || echo 'Warning: Signature verification failed'
-        " 2>"$STDERR_FILE"
 
-        echo "=== Step 2: Find upstream directory with package.json ==="
-        # The upstream directory contains package.json needed by electron-builder
-        UPSTREAM_DIR=$($SSH_CMD "find $REMOTE_WORK_DIR -name 'package.json' -type f | head -1 | xargs dirname" | tr -d '\r\n')
-        
-        if [ -z "$UPSTREAM_DIR" ]; then
-            echo "ERROR: Could not find package.json in work directory"
-            exit 1
-        fi
-        echo "UPSTREAM_DIR: $UPSTREAM_DIR"
+            SIGNED_APP_PATH=$(echo "$PULL_OUTPUT" | tail -1 | tr -d '\r\n')
+            echo "Signed app path: $SIGNED_APP_PATH"
 
-        echo "=== Step 3: Create DMG with electron-builder ==="
-        # Get the relative path from upstream to .app
-        APP_NAME=$(basename "$SIGNED_APP_PATH")
-        
-        $SSH_CMD "
-            set -e
-            cd '$UPSTREAM_DIR'
+            if [ -z "$SIGNED_APP_PATH" ]; then
+                echo "ERROR: SIGNED_APP_PATH is empty after pull"
+                exit 1
+            fi
+
+            echo "--- Verify signed .app ---"
+            $SSH_CMD "
+                if [ ! -d '$SIGNED_APP_PATH' ]; then
+                    echo 'ERROR: Signed .app not found at: $SIGNED_APP_PATH'
+                    exit 1
+                fi
+                echo 'Found signed .app: $SIGNED_APP_PATH'
+                codesign --verify --deep --strict '$SIGNED_APP_PATH' || echo 'Warning: Signature verification failed'
+            " 2>>"$STDERR_FILE"
+
+            echo "--- Create DMG with electron-builder ---"
+            APP_NAME=$(basename "$SIGNED_APP_PATH")
+            APP_DIR=$(dirname "$SIGNED_APP_PATH")
             
-            # Get the .app directory relative to upstream
-            APP_DIR=\$(dirname '$SIGNED_APP_PATH')
-            APP_RELATIVE_PATH=\$(realpath --relative-to='$UPSTREAM_DIR' \"\$APP_DIR\")
-            
-            echo 'APP_NAME: $APP_NAME'
-            echo 'APP_DIR: '\$APP_DIR
-            echo 'APP_RELATIVE_PATH: '\$APP_RELATIVE_PATH
-            
-            # Set temp directory to avoid permission issues
-            export TMPDIR=/tmp
-            
-            # Create minimal DMG config if needed
-            # electron-builder needs dmg config for background, icon positioning, etc.
-            if [ ! -f dmg-config.json ]; then
-                echo 'Creating minimal dmg-config.json...'
-                cat > dmg-config.json << 'DMGEOF'
-        {
-          \"dmg\": {
-            \"contents\": [
-              { \"x\": 130, \"y\": 220 },
-              { \"x\": 410, \"y\": 220, \"type\": \"link\", \"path\": \"/Applications\" }
-            ],
-            \"window\": {
-              \"width\": 540,
-              \"height\": 400
-            }
-          },
-          \"mac\": {
-            \"identity\": null
-          }
-        }
-        DMGEOF
+            # Determine arch flag for electron-builder
+            ARCH_FLAG="--arm64"
+            if [ "$ARCH" == "amd64" ] || [ "$ARCH" == "x64" ]; then
+                ARCH_FLAG="--x64"
             fi
             
-            # Run electron-builder to create DMG
-            # --prepackaged points to the directory containing the signed .app
-            # Disable code signing (already signed)
-            echo 'Running electron-builder...'
-            npx electron-builder --mac dmg --arm64 \\
-                --prepackaged \"\$APP_RELATIVE_PATH/$APP_NAME\" \\
-                --config dmg-config.json \\
-                -c.mac.identity=null
+            $SSH_CMD "
+                set -e
+                export PATH=\"/usr/local/bin:/opt/homebrew/bin:\$PATH\"
+                cd '$REMOTE_WORK_DIR'
+
+                export TMPDIR=/tmp
+
+                # Check for dmg-config.json from signed artifact (pushed by mac_signer.py) - required
+                if [ ! -f 'signed_app/dmg-config.json' ]; then
+                    echo 'ERROR: dmg-config.json not found in signed artifact'
+                    echo 'Expected at: signed_app/dmg-config.json'
+                    echo 'Contents of signed_app:'
+                    ls -la signed_app/ || true
+                    exit 1
+                fi
+                echo 'Found dmg-config.json from signed artifact'
+                cp signed_app/dmg-config.json dmg-config.json
+
+                # Add electronVersion if not present in config
+                # TODO: Build pipeline should include electronVersion in dmg-config.json
+                if ! grep -q 'electronVersion' dmg-config.json; then
+                    echo 'Adding hardcoded electronVersion (should come from build)'
+                    jq '. + {electronVersion: \"33.2.1\"}' dmg-config.json > dmg-config.tmp && mv dmg-config.tmp dmg-config.json
+                fi
+
+                # Copy buildResources from signed artifact if available (for DMG background, icons)
+                if [ -d 'signed_app/buildResources' ]; then
+                    echo 'Found buildResources from signed artifact, copying...'
+                    cp -r signed_app/buildResources ./
+                    ls -la buildResources/ || true
+                fi
+
+                # Copy package.json from signed artifact (required by electron-builder)
+                if [ -f 'signed_app/package.json' ]; then
+                    echo 'Found package.json from signed artifact, copying...'
+                    cp signed_app/package.json ./
+                else
+                    echo 'ERROR: package.json not found in signed artifact'
+                    echo 'Expected at: signed_app/package.json'
+                    echo 'Contents of signed_app:'
+                    ls -la signed_app/ || true
+                    exit 1
+                fi
+
+                echo 'Using dmg-config.json:'
+                cat dmg-config.json
+
+                echo 'Running electron-builder...'
+                npx electron-builder --mac dmg $ARCH_FLAG \\
+                    --prepackaged 'signed_app/$APP_NAME' \\
+                    --config dmg-config.json \\
+                    -c.mac.identity=null
+                
+                ls -lh dist/*.dmg
+            " 2>>"$STDERR_FILE"
+
+            echo "--- Get DMG path ---"
+            DMG_NAME=$($SSH_CMD "basename \"\$(ls -1 '$REMOTE_WORK_DIR/dist/'*.dmg | head -1)\"" | tr -d '\r\n')
+            DMG_PATH="${REMOTE_WORK_DIR}/dist/${DMG_NAME}"
             
-            echo ''
-            echo 'DMG created:'
-            ls -lh dist/*.dmg
-        " 2>>"$STDERR_FILE"
+            echo "DMG_NAME: $DMG_NAME"
+            echo "DMG_PATH: $DMG_PATH"
 
-        echo "=== Step 4: Get DMG path ==="
-        DMG_NAME=$($SSH_CMD "ls -1 '$UPSTREAM_DIR/dist/'*.dmg | head -1 | xargs basename" | tr -d '\r\n')
-        DMG_PATH="${UPSTREAM_DIR}/dist/${DMG_NAME}"
-        
-        echo "DMG_NAME: $DMG_NAME"
-        echo "DMG_PATH: $DMG_PATH"
+            echo "--- Move DMG to signed_dmg directory ---"
+            SIGNED_DMG_DIR="${REMOTE_WORK_DIR}/signed_dmg"
+            SIGNED_DMG_PATH="${SIGNED_DMG_DIR}/${DMG_NAME}"
+            
+            $SSH_CMD "
+                set -e
+                mkdir -p '$SIGNED_DMG_DIR'
+                mv '$DMG_PATH' '$SIGNED_DMG_PATH'
+                echo 'DMG moved to: $SIGNED_DMG_PATH'
+                ls -lh '$SIGNED_DMG_PATH'
+            " 2>>"$STDERR_FILE"
 
-        # Write results
-        echo -n "$DMG_PATH" > "$(results.dmg_path.path)"
-        echo -n "$DMG_NAME" > "$(results.dmg_name.path)"
+            echo "DMG stored at: $SIGNED_DMG_PATH"
+
+            # TODO: ORAS push disabled - DMG file (~1.1GB) exceeds Quay.io blob size limit (413 Request Entity Too Large)
+            # Once Quay quota is increased or alternative storage is available, re-enable this:
+            # OUTPUT_TAG="${OUTPUT_REGISTRY}/installer-pipeline-unsigned-dmg:${COMPONENT_NAME}-${ARCH}-${PIPELINE_RUN_UID}"
+            # echo "Pushing to: $OUTPUT_TAG"
+            # $SSH_CMD "
+            #     set -e
+            #     cd '$REMOTE_WORK_DIR/signed_dmg'
+            #     echo 'Pushing DMG...'
+            #     /usr/local/bin/oras push '$OUTPUT_TAG' '$DMG_NAME' --registry-config '$REGISTRY_CONFIG_PATH'
+            #     echo 'Push complete'
+            # " 2>>"$STDERR_FILE"
+
+            # Add to output array (using path instead of pullspec since oras push is disabled)
+            CREATED_DMGS=$(jq --arg component "$COMPONENT_NAME" \
+                              --arg arch "$ARCH" \
+                              --arg dmg_path "$SIGNED_DMG_PATH" \
+                              --arg dmg_name "$DMG_NAME" \
+                              '. + [{component: $component, arch: $arch, dmg_path: $dmg_path, dmg_name: $dmg_name}]' \
+                              <<< "$CREATED_DMGS")
+        done
 
         echo ""
         echo "=== Create-mac-dmg complete ==="
-        echo "DMG path: $DMG_PATH"
-        echo "DMG name: $DMG_NAME"
+        echo "Created $APP_COUNT DMG(s):"
+        jq '.' <<< "$CREATED_DMGS"
+
+        # Write results
+        echo -n "$CREATED_DMGS" > "$(results.created_dmgs.path)"
 
 

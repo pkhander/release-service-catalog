@@ -4,7 +4,7 @@ kind: Task
 metadata:
   name: generate-checksums
   annotations:
-    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/pipelines.minVersion: "0.1.0"
     tekton.dev/tags: release
 spec:
   description: |-
@@ -13,33 +13,33 @@ spec:
     This task:
     - Pulls signed artifacts from Quay (DMG and/or Windows installer)
     - Generates SHA256 checksums
-    - GPG signs the checksums using Kerberos/keytab authentication
-    - Stores checksums in workspace for push-to-cdn
+    - SSH to checksum host using Kerberos/keytab authentication
+    - Signs checksums using rpm-sign (clearsign .sig and gpgsign .gpg)
+    - Stores signed checksums in workspace for push-to-cdn
   params:
-    - name: signed_mac_dmg_pullspec
+    - name: signed_dmgs
       type: string
-      description: OCI pullspec for the signed Mac DMG (empty if no Mac content)
-      default: ""
-    - name: signed_windows_installer_pullspec
+      description: JSON array of signed Mac DMGs [{component, arch, signed_pullspec, dmg_name}] (empty array if none)
+      default: "[]"
+    - name: signed_installers
       type: string
-      description: OCI pullspec for the signed Windows installer (empty if no Windows content)
-      default: ""
-    - name: component_name
-      type: string
-      description: Name of the component
+      description: >-
+        JSON array of signed Windows installers
+        [{component, arch, signed_pullspec, installer_name}] (empty array if none)
+      default: "[]"
     - name: author
       type: string
-      description: Author for GPG signing
+      description: Author for GPG signing (onbehalfof parameter for rpm-sign)
     - name: signingKeyName
       type: string
-      description: Signing key name for GPG signing
+      description: Signing key name for rpm-sign
     - name: quaySecret
       type: string
       description: Secret containing Quay credentials for oras pull
       default: quay-credentials
     - name: checksumCredentials
       type: string
-      description: Secret containing keytab, user, host for checksum signing
+      description: Secret containing keytab, user, host, fingerprint for checksum signing
       default: checksum-credentials
     - name: kerberosRealm
       type: string
@@ -57,7 +57,7 @@ spec:
     - name: result
       description: Success if the task succeeds, the error otherwise
     - name: checksums_generated
-      description: "true" if checksums were generated, "false" otherwise
+      description: '"true" if checksums were generated, "false" otherwise'
   workspaces:
     - name: data
       description: Workspace for storing checksums
@@ -104,12 +104,10 @@ spec:
         - name: checksum-credentials
           mountPath: /mnt/checksum-credentials
       env:
-        - name: SIGNED_MAC_DMG_PULLSPEC
-          value: "$(params.signed_mac_dmg_pullspec)"
-        - name: SIGNED_WINDOWS_INSTALLER_PULLSPEC
-          value: "$(params.signed_windows_installer_pullspec)"
-        - name: COMPONENT_NAME
-          value: "$(params.component_name)"
+        - name: SIGNED_DMGS
+          value: "$(params.signed_dmgs)"
+        - name: SIGNED_INSTALLERS
+          value: "$(params.signed_installers)"
         - name: AUTHOR
           value: "$(params.author)"
         - name: SIGNING_KEY_NAME
@@ -118,13 +116,23 @@ spec:
           value: "$(params.kerberosRealm)"
       script: |
         #!/usr/bin/env bash
-        set -e
+        set -eu
 
         # Load secrets
         QUAY_USER=$(cat /mnt/quay-secret/username)
         QUAY_PASS=$(cat /mnt/quay-secret/password)
 
         set -x
+
+        #---------------------------------------------------------------------------------------
+        # This step generates checksums for all signed binaries and signs them using the
+        # checksum host. The workflow:
+        # 1. Pull signed DMGs and Windows installers from Quay using oras
+        # 2. Generate sha256sum.txt for each component
+        # 3. SCP checksums to checksum host
+        # 4. Sign using rpm-sign (clearsign .sig and gpgsign .gpg)
+        # 5. Copy signed files back
+        #---------------------------------------------------------------------------------------
 
         STDERR_FILE=/tmp/stderr.txt
 
@@ -145,107 +153,174 @@ spec:
         }
         trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
 
-        ARTIFACTS_DIR="$(workspaces.data.path)/artifacts/${COMPONENT_NAME}"
-        CHECKSUMS_DIR="${ARTIFACTS_DIR}/checksums"
-        mkdir -p "$ARTIFACTS_DIR" "$CHECKSUMS_DIR"
+        if [[ ${AUTHOR} == "" ]] ; then
+          echo Error: invalid author
+          exit 1
+        fi
+
+        # SSH options for GSSAPI authentication
+        SSH_OPTS="-o UserKnownHostsFile=/tmp/.ssh/known_hosts \
+                    -o GSSAPIAuthentication=yes \
+                    -o GSSAPIDelegateCredentials=yes \
+                    -o IdentitiesOnly=yes"
+
+        # Read checksum configuration from secret
+        checksum_user=$(cat /mnt/checksum-credentials/user)
+        checksum_host=$(cat /mnt/checksum-credentials/host)
+
+        sign_file() {
+            local component_name=$1
+            local sign_method=$2  # The signing method: --clearsign or --gpgsign
+            local extension=$3
+            pipeline_run_uid=$(context.taskRun.uid)
+            output_path="/home/$checksum_user/${pipeline_run_uid}_${component_name}/checksum/sha256sum.txt.$extension"
+            input_file="/home/$checksum_user/${pipeline_run_uid}_${component_name}/checksum/sha256sum.txt"
+
+            echo "Executing SSH command with sign method: $sign_method for component: $component_name"
+            # shellcheck disable=SC2029,SC2086
+            ssh $SSH_OPTS "$checksum_user@$checksum_host" \
+            "rpm-sign --nat $sign_method --key $SIGNING_KEY_NAME --onbehalfof=$AUTHOR \
+            --output $output_path $input_file"
+        }
+
+        # Generate a kerberos ticket to ssh to the checksum host.
+        # The ticket is required for interacting with rpm-sign as well,
+        # so we use GSSAPI Delegate (in ssh opts) to transfer the ticket to the checksum host
+        KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u)
+        export KRB5CCNAME
+        base64 -d /mnt/checksum-credentials/keytab > /tmp/sa.keytab
+        retry 5 kinit -kt /tmp/sa.keytab "${checksum_user}@${KERBEROS_REALM}"
+
+        mkdir -p /tmp/.ssh
+        chmod 700 /tmp/.ssh
+        cp /mnt/checksum-credentials/fingerprint /tmp/.ssh/known_hosts
+        chmod 600 /tmp/.ssh/known_hosts
+
+        BASE_ARTIFACTS_DIR="$(workspaces.data.path)/artifacts"
+        mkdir -p "$BASE_ARTIFACTS_DIR"
 
         # Login to Quay
         set +x
-        echo "$QUAY_PASS" | oras login quay.io -u "$QUAY_USER" --password-stdin
+        oras login quay.io -u "$QUAY_USER" -p "$QUAY_PASS"
         set -x
 
         CHECKSUMS_GENERATED="false"
 
-        echo "=== Step 1: Pull signed artifacts ==="
-        
-        # Pull Mac DMG if provided
-        if [ -n "$SIGNED_MAC_DMG_PULLSPEC" ]; then
-            echo "Pulling signed Mac DMG from: $SIGNED_MAC_DMG_PULLSPEC"
-            mkdir -p "$ARTIFACTS_DIR/mac"
-            cd "$ARTIFACTS_DIR/mac"
-            oras pull "$SIGNED_MAC_DMG_PULLSPEC" 2>"$STDERR_FILE" || {
+        echo "=== Step 1: Pull signed Mac DMGs ==="
+        DMG_COUNT=$(jq 'length' <<< "$SIGNED_DMGS")
+        echo "Found $DMG_COUNT signed DMGs"
+
+        for i in $(seq 0 $((DMG_COUNT - 1))); do
+            DMG=$(jq -c ".[$i]" <<< "$SIGNED_DMGS")
+            SIGNED_PULLSPEC=$(jq -r '.signed_pullspec' <<< "$DMG")
+            COMPONENT=$(jq -r '.component' <<< "$DMG")
+            ARCH=$(jq -r '.arch' <<< "$DMG")
+            DMG_NAME=$(jq -r '.dmg_name' <<< "$DMG")
+
+            # Flat structure: all files directly in component directory
+            # DMG filename should already include arch (e.g., podman-desktop-1.0.0-arm64.dmg)
+            ARTIFACTS_DIR="${BASE_ARTIFACTS_DIR}/${COMPONENT}"
+            mkdir -p "$ARTIFACTS_DIR"
+
+            echo "Pulling DMG for $COMPONENT ($ARCH): $SIGNED_PULLSPEC"
+            cd "$ARTIFACTS_DIR"
+            oras pull "$SIGNED_PULLSPEC" 2>"$STDERR_FILE" || {
                 echo "Warning: Failed to pull Mac DMG"
             }
             ls -la
             cd -
-        fi
+        done
 
-        # Pull Windows installer if provided
-        if [ -n "$SIGNED_WINDOWS_INSTALLER_PULLSPEC" ]; then
-            echo "Pulling signed Windows installer from: $SIGNED_WINDOWS_INSTALLER_PULLSPEC"
-            mkdir -p "$ARTIFACTS_DIR/windows"
-            cd "$ARTIFACTS_DIR/windows"
-            oras pull "$SIGNED_WINDOWS_INSTALLER_PULLSPEC" 2>"$STDERR_FILE" || {
+        echo "=== Step 2: Pull signed Windows installers ==="
+        INSTALLER_COUNT=$(jq 'length' <<< "$SIGNED_INSTALLERS")
+        echo "Found $INSTALLER_COUNT signed Windows installers"
+
+        for i in $(seq 0 $((INSTALLER_COUNT - 1))); do
+            INSTALLER=$(jq -c ".[$i]" <<< "$SIGNED_INSTALLERS")
+            SIGNED_PULLSPEC=$(jq -r '.signed_pullspec' <<< "$INSTALLER")
+            COMPONENT=$(jq -r '.component' <<< "$INSTALLER")
+            ARCH=$(jq -r '.arch' <<< "$INSTALLER")
+            INSTALLER_NAME=$(jq -r '.installer_name' <<< "$INSTALLER")
+
+            # Flat structure: all files directly in component directory
+            # Installer filename should already include arch (e.g., podman-desktop-1.0.0-x64.exe)
+            ARTIFACTS_DIR="${BASE_ARTIFACTS_DIR}/${COMPONENT}"
+            mkdir -p "$ARTIFACTS_DIR"
+
+            echo "Pulling installer for $COMPONENT ($ARCH): $SIGNED_PULLSPEC"
+            cd "$ARTIFACTS_DIR"
+            oras pull "$SIGNED_PULLSPEC" 2>"$STDERR_FILE" || {
                 echo "Warning: Failed to pull Windows installer"
             }
             ls -la
             cd -
-        fi
+        done
 
-        echo "=== Step 2: Generate SHA256 checksums ==="
-        cd "$ARTIFACTS_DIR"
-        
-        # Find all artifacts and generate checksums
-        CHECKSUM_FILE="${CHECKSUMS_DIR}/sha256sum.txt"
-        
-        # Generate checksums for Mac artifacts
-        if [ -d "mac" ]; then
-            find mac -type f \( -name "*.dmg" -o -name "*.zip" \) | while read -r file; do
-                echo "Generating checksum for: $file"
-                sha256sum "$file" >> "$CHECKSUM_FILE"
-                CHECKSUMS_GENERATED="true"
+        echo "=== Step 3: Generate SHA256 checksums per component ==="
+        # Find all unique components from both DMGs and installers
+        COMPONENTS=$(echo "$SIGNED_DMGS$SIGNED_INSTALLERS" \
+            | jq -rs '[.[].component] | unique | .[]' 2>/dev/null | sort -u)
+
+        for COMPONENT in $COMPONENTS; do
+            ARTIFACTS_DIR="${BASE_ARTIFACTS_DIR}/${COMPONENT}"
+            CHECKSUM_FILE="${ARTIFACTS_DIR}/sha256sum.txt"
+
+            echo "Generating checksums for component: $COMPONENT"
+            cd "$ARTIFACTS_DIR"
+
+            # Find all binary files (DMGs, EXEs) - exclude checksum files
+            # Flat structure: checksum file uses just filenames (no paths)
+            find . -maxdepth 1 -type f \( -name "*.dmg" -o -name "*.exe" \) 2>/dev/null | while read -r file; do
+                filename=$(basename "$file")
+                checksum=$(sha256sum "$file" | awk '{ print $1 }')
+                echo "$checksum  $filename" >> "$CHECKSUM_FILE"
             done
-        fi
 
-        # Generate checksums for Windows artifacts
-        if [ -d "windows" ]; then
-            find windows -type f \( -name "*.exe" -o -name "*.zip" \) | while read -r file; do
-                echo "Generating checksum for: $file"
-                sha256sum "$file" >> "$CHECKSUM_FILE"
+            if [ -f "$CHECKSUM_FILE" ]; then
+                echo "=== Checksums for $COMPONENT ==="
+                cat "$CHECKSUM_FILE"
                 CHECKSUMS_GENERATED="true"
-            done
-        fi
-
-        if [ -f "$CHECKSUM_FILE" ]; then
-            echo "=== Generated checksums ==="
-            cat "$CHECKSUM_FILE"
-            CHECKSUMS_GENERATED="true"
-        else
-            echo "No artifacts found to generate checksums for"
-        fi
-
-        echo "=== Step 3: GPG sign checksums ==="
-        # Note: GPG signing with Kerberos/keytab requires proper setup
-        # This is a placeholder for the actual signing logic
-        # In production, this would use rpm-sign or a similar tool
-        
-        if [ -f "$CHECKSUM_FILE" ] && [ -f /mnt/checksum-credentials/keytab ]; then
-            echo "GPG signing checksums..."
-            
-            # Setup Kerberos authentication
-            export KRB5CCNAME=/tmp/krb5cc_signing
-            KEYTAB_FILE="/mnt/checksum-credentials/keytab"
-            CHECKSUM_USER=$(cat /mnt/checksum-credentials/user 2>/dev/null || echo "")
-            CHECKSUM_HOST=$(cat /mnt/checksum-credentials/host 2>/dev/null || echo "")
-            
-            if [ -n "$CHECKSUM_USER" ] && [ -f "$KEYTAB_FILE" ]; then
-                kinit -kt "$KEYTAB_FILE" "${CHECKSUM_USER}@${KERBEROS_REALM}" 2>"$STDERR_FILE" || {
-                    echo "Warning: Kerberos authentication failed, skipping GPG signing"
-                }
-                
-                # Create GPG signature
-                # In production, would use: gpg --armor --detach-sign --default-key "$SIGNING_KEY_NAME" "$CHECKSUM_FILE"
-                # For now, create placeholder
-                echo "Checksum signature placeholder - signed by $AUTHOR with key $SIGNING_KEY_NAME" > "${CHECKSUM_FILE}.asc"
-                echo "GPG signature created: ${CHECKSUM_FILE}.asc"
-            else
-                echo "Warning: Checksum credentials incomplete, skipping GPG signing"
-                # Create unsigned placeholder
-                touch "${CHECKSUM_FILE}.asc"
             fi
-        else
-            echo "Skipping GPG signing (no checksums or credentials)"
-        fi
+            cd -
+        done
+
+        echo "=== Step 4: Sign checksums on checksum host ==="
+
+        for COMPONENT in $COMPONENTS; do
+            # Flat structure: checksum files directly in component directory
+            ARTIFACTS_DIR="${BASE_ARTIFACTS_DIR}/${COMPONENT}"
+            CHECKSUM_FILE="${ARTIFACTS_DIR}/sha256sum.txt"
+
+            if [ -f "$CHECKSUM_FILE" ]; then
+                echo "Signing checksums for $COMPONENT..."
+
+                # Send sha256sum.txt to the checksum host for signing (component-specific path)
+                REMOTE_DIR="$(context.taskRun.uid)_${COMPONENT}"
+                # shellcheck disable=SC2029,SC2086
+                ssh $SSH_OPTS "${checksum_user}@${checksum_host}" "mkdir -p ~/${REMOTE_DIR}/checksum"
+                # shellcheck disable=SC2086
+                scp $SSH_OPTS "${CHECKSUM_FILE}" \
+                "${checksum_user}@${checksum_host}:~/${REMOTE_DIR}/checksum"
+
+                sign_file "$COMPONENT" --clearsign sig
+                sign_file "$COMPONENT" --gpgsign gpg
+
+                # Copy the signed checksum files back to flat component directory
+                scp "$SSH_OPTS" \
+                "${checksum_user}@${checksum_host}:~/${REMOTE_DIR}/checksum/sha256sum.txt.sig" \
+                "${ARTIFACTS_DIR}/sha256sum.txt.sig"
+
+                scp "$SSH_OPTS" \
+                "${checksum_user}@${checksum_host}:~/${REMOTE_DIR}/checksum/sha256sum.txt.gpg" \
+                "${ARTIFACTS_DIR}/sha256sum.txt.gpg"
+
+                # Clean up remote checksum directory
+                # shellcheck disable=SC2029,SC2086
+                ssh $SSH_OPTS "${checksum_user}@${checksum_host}" "rm -rf ~/${REMOTE_DIR}"
+
+                echo "Signed checksums for $COMPONENT: sha256sum.txt.sig and sha256sum.txt.gpg"
+            fi
+        done
 
         # Write results
         echo -n "$CHECKSUMS_GENERATED" > "$(results.checksums_generated.path)"
@@ -253,9 +328,8 @@ spec:
         echo ""
         echo "=== Generate-checksums complete ==="
         echo "Checksums generated: $CHECKSUMS_GENERATED"
-        if [ -d "$CHECKSUMS_DIR" ]; then
-            echo "Checksum files:"
-            ls -la "$CHECKSUMS_DIR"
-        fi
-
-
+        echo "Artifact structure (flat per component):"
+        for COMPONENT in $COMPONENTS; do
+            echo "  artifacts/${COMPONENT}/"
+            ls -la "${BASE_ARTIFACTS_DIR}/${COMPONENT}/" 2>/dev/null | grep -v "^total" | head -20
+        done

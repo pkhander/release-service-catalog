@@ -1,0 +1,321 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: create-mac-dmg-v2
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release, macos-build
+  labels:
+    app.kubernetes.io/version: "0.1"
+    build.appstudio.redhat.com/build_type: macos-native
+spec:
+  description: |-
+    Tekton task to create macOS DMG installer from a signed .app bundle.
+    
+    This task:
+    - Runs on MPC-provisioned Mac VM (no signing credentials needed)
+    - Pulls signed .app from OCI registry via oras
+    - Uses electron-builder to create DMG
+    - Pushes unsigned DMG to OCI registry
+    
+    Part of the mac signing pipeline: sign-mac-app -> create-mac-dmg-v2 -> sign-mac-dmg
+  params:
+    - name: signed_apps
+      type: string
+      description: JSON array of signed apps [{component, arch, pullspec}] from sign-mac-app
+    - name: PLATFORM
+      type: string
+      description: The platform to build on (macos/arm64 or macos/amd64)
+      default: "macos/arm64"
+    - name: outputRegistry
+      type: string
+      description: Registry to push DMG artifacts to
+      default: quay.io/redhat-pending
+    - name: quaySecret
+      type: string
+      description: Secret containing Quay credentials for oras pull/push
+      default: quay-credentials
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: result
+      description: Success if the task succeeds, the error otherwise
+    - name: created_dmgs
+      description: JSON array of created DMGs [{component, arch, pullspec, dmg_name}]
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: ssh
+      secret:
+        optional: false
+        secretName: multi-platform-ssh-$(context.taskRun.name)
+    - name: quay-secret
+      secret:
+        secretName: $(params.quaySecret)
+        defaultMode: 0444
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    env:
+      - name: SIGNED_APPS
+        value: "$(params.signed_apps)"
+      - name: OUTPUT_REGISTRY
+        value: "$(params.outputRegistry)"
+      - name: PLATFORM
+        value: "$(params.PLATFORM)"
+    volumeMounts:
+      - name: workdir
+        mountPath: /var/workdir
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+
+  steps:
+    - name: create-dmg
+      image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
+      computeResources:
+        limits:
+          memory: 512Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      volumeMounts:
+        - name: ssh
+          mountPath: /ssh
+          readOnly: true
+        - name: quay-secret
+          mountPath: /mnt/quay-secret
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        STDERR_FILE=/tmp/stderr.txt
+
+        # Validate we have apps
+        APP_COUNT=$(jq 'length' <<< "$SIGNED_APPS")
+        if [ "$APP_COUNT" -eq 0 ]; then
+            echo "ERROR: No signed apps found in signed_apps array"
+            exit 1
+        fi
+        
+        echo "Found $APP_COUNT signed app(s) to create DMGs for"
+
+        exitfunc() {
+            local err=$1
+            local line=$2
+            local command="$3"
+            if [ "$err" -eq 0 ] ; then
+                echo -n "Success" > "$(results.result.path)"
+            else
+                echo "$0: ERROR '$command' failed at line $line - exited with status $err" \
+                  > "$(results.result.path)"
+                if [ -f "$STDERR_FILE" ] ; then
+                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                fi
+            fi
+            exit $err
+        }
+        trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
+
+        set -x
+
+        # =========================================================================
+        # MPC SSH Setup
+        # =========================================================================
+        mkdir -p ~/.ssh
+        if [ -e "/ssh/error" ]; then
+            cat /ssh/error
+            exit 1
+        elif [ -e "/ssh/otp" ]; then
+            curl --cacert /ssh/otp-ca -XPOST -d @/ssh/otp "$(cat /ssh/otp-server)" >~/.ssh/id_rsa
+            echo "" >> ~/.ssh/id_rsa
+        else
+            cp /ssh/id_rsa ~/.ssh
+        fi
+        chmod 0400 ~/.ssh/id_rsa
+        
+        SSH_HOST=$(cat /ssh/host)
+        BUILD_DIR=$(cat /ssh/user-dir)
+        SSH_ARGS=(-o StrictHostKeyChecking=no -o ServerAliveInterval=60)
+
+        echo "SSH_HOST: $SSH_HOST"
+        echo "BUILD_DIR: $BUILD_DIR"
+
+        # Create remote directories
+        ssh "${SSH_ARGS[@]}" "$SSH_HOST" mkdir -p "$BUILD_DIR/work" "$BUILD_DIR/scripts" "$BUILD_DIR/output"
+
+        # Load quay credentials
+        QUAY_USER=$(cat /mnt/quay-secret/username)
+        QUAY_PASS=$(cat /mnt/quay-secret/password)
+
+        # Initialize output array
+        CREATED_DMGS="[]"
+
+        # Loop over all signed apps
+        for i in $(seq 0 $((APP_COUNT - 1))); do
+            APP=$(jq -c ".[$i]" <<< "$SIGNED_APPS")
+            COMPONENT_NAME=$(jq -r '.component' <<< "$APP")
+            ARCH=$(jq -r '.arch' <<< "$APP")
+            SIGNED_PULLSPEC=$(jq -r '.pullspec' <<< "$APP")
+
+            echo ""
+            echo "=== Creating DMG $((i + 1))/$APP_COUNT ==="
+            echo "Component: $COMPONENT_NAME"
+            echo "Arch: $ARCH"
+            echo "Pullspec: $SIGNED_PULLSPEC"
+
+            REMOTE_WORK_DIR="${BUILD_DIR}/work/${COMPONENT_NAME}_${ARCH}"
+
+            # Create the remote build script
+            cat > /var/workdir/build-dmg.sh << 'REMOTESCRIPT'
+        #!/bin/bash
+        set -euo pipefail
+
+        WORK_DIR="$1"
+        PULLSPEC="$2"
+        COMPONENT="$3"
+        ARCH="$4"
+        QUAY_USER="$5"
+        QUAY_PASS="$6"
+        OUTPUT_REGISTRY="$7"
+
+        cd "$WORK_DIR"
+        mkdir -p source output
+
+        echo "--- Installing oras if needed ---"
+        if ! command -v oras &> /dev/null; then
+            brew install oras
+        fi
+
+        echo "--- Pulling signed .app from OCI registry ---"
+        echo "$QUAY_PASS" | oras login quay.io -u "$QUAY_USER" --password-stdin
+        oras pull "$PULLSPEC" -o source/
+
+        echo "--- Finding .app bundle ---"
+        APP_PATH=$(find source -name "*.app" -type d | head -1)
+        if [ -z "$APP_PATH" ]; then
+            echo "ERROR: No .app bundle found in pulled artifact"
+            ls -laR source/
+            exit 1
+        fi
+        echo "Found .app: $APP_PATH"
+        APP_NAME=$(basename "$APP_PATH")
+
+        echo "--- Verifying signature ---"
+        codesign --verify --deep --strict "$APP_PATH" || echo "Warning: Signature verification failed"
+
+        echo "--- Finding package.json for electron-builder ---"
+        UPSTREAM_DIR=$(find source -name "package.json" -type f | head -1 | xargs dirname)
+        if [ -z "$UPSTREAM_DIR" ]; then
+            echo "ERROR: Could not find package.json"
+            exit 1
+        fi
+        echo "UPSTREAM_DIR: $UPSTREAM_DIR"
+
+        echo "--- Creating DMG with electron-builder ---"
+        cd "$UPSTREAM_DIR"
+
+        # Determine arch flag
+        ARCH_FLAG="--arm64"
+        if [ "$ARCH" == "amd64" ] || [ "$ARCH" == "x64" ]; then
+            ARCH_FLAG="--x64"
+        fi
+
+        # Get relative path to .app
+        APP_DIR=$(dirname "$WORK_DIR/$APP_PATH")
+        APP_RELATIVE_PATH=$(realpath --relative-to="$PWD" "$APP_DIR")
+
+        # Create DMG config if not present
+        if [ ! -f dmg-config.json ]; then
+            cat > dmg-config.json << 'DMGEOF'
+        {
+          "dmg": {
+            "contents": [
+              { "x": 130, "y": 220 },
+              { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+            ],
+            "window": { "width": 540, "height": 400 }
+          },
+          "mac": { "identity": null }
+        }
+        DMGEOF
+        fi
+
+        export TMPDIR=/tmp
+
+        npx electron-builder --mac dmg $ARCH_FLAG \
+            --prepackaged "$APP_RELATIVE_PATH/$APP_NAME" \
+            --config dmg-config.json \
+            -c.mac.identity=null
+
+        echo "--- DMG created ---"
+        ls -lh dist/*.dmg
+
+        DMG_PATH=$(ls -1 dist/*.dmg | head -1)
+        DMG_NAME=$(basename "$DMG_PATH")
+
+        echo "--- Pushing DMG to OCI registry ---"
+        OUTPUT_TAG="${OUTPUT_REGISTRY}/${COMPONENT}-dmg:${ARCH}-unsigned"
+        oras push "$OUTPUT_TAG" "$DMG_PATH:application/octet-stream"
+
+        echo "--- Output ---"
+        echo "DMG_NAME=$DMG_NAME"
+        echo "DMG_PULLSPEC=$OUTPUT_TAG"
+        REMOTESCRIPT
+
+            chmod +x /var/workdir/build-dmg.sh
+
+            # Copy script to remote
+            rsync -az /var/workdir/build-dmg.sh "$SSH_HOST:$BUILD_DIR/scripts/"
+
+            # Run the build script on the Mac
+            set +x
+            OUTPUT=$(ssh "${SSH_ARGS[@]}" "$SSH_HOST" \
+                "$BUILD_DIR/scripts/build-dmg.sh \
+                    '$REMOTE_WORK_DIR' \
+                    '$SIGNED_PULLSPEC' \
+                    '$COMPONENT_NAME' \
+                    '$ARCH' \
+                    '$QUAY_USER' \
+                    '$QUAY_PASS' \
+                    '$OUTPUT_REGISTRY'" 2>"$STDERR_FILE")
+            set -x
+
+            echo "$OUTPUT"
+
+            # Parse output
+            DMG_NAME=$(echo "$OUTPUT" | grep "^DMG_NAME=" | cut -d= -f2)
+            DMG_PULLSPEC=$(echo "$OUTPUT" | grep "^DMG_PULLSPEC=" | cut -d= -f2)
+
+            echo "DMG_NAME: $DMG_NAME"
+            echo "DMG_PULLSPEC: $DMG_PULLSPEC"
+
+            # Add to output array
+            CREATED_DMGS=$(jq --arg component "$COMPONENT_NAME" \
+                              --arg arch "$ARCH" \
+                              --arg pullspec "$DMG_PULLSPEC" \
+                              --arg dmg_name "$DMG_NAME" \
+                              '. + [{component: $component, arch: $arch, pullspec: $pullspec, dmg_name: $dmg_name}]' \
+                              <<< "$CREATED_DMGS")
+        done
+
+        echo ""
+        echo "=== Create-mac-dmg-v2 complete ==="
+        echo "Created $APP_COUNT DMG(s):"
+        jq '.' <<< "$CREATED_DMGS"
+
+        # Write results
+        echo -n "$CREATED_DMGS" > "$(results.created_dmgs.path)"
+

@@ -4,7 +4,7 @@ kind: Task
 metadata:
   name: extract-installer-payload
   annotations:
-    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/pipelines.minVersion: "0.1.0"
     tekton.dev/tags: release
 spec:
   description: |-
@@ -12,8 +12,8 @@ spec:
     
     This task:
     - Fetches OCI manifest for each component in the snapshot
-    - Identifies platform-specific artifacts (macOS, Windows) by artifactType + platform
-    - Returns metadata including pullspecs for signing tasks to pull directly
+    - Auto-discovers ALL platform-specific artifacts (macOS, Windows) by artifactType + OS
+    - Returns metadata including pullspecs for ALL architectures found
     
     Does NOT extract or re-package content - signing VMs pull directly via oras.
   params:
@@ -28,10 +28,6 @@ spec:
       type: string
       description: Platform OS for macOS artifacts
       default: "darwin"
-    - name: macPlatformArch
-      type: string
-      description: Platform architecture for macOS artifacts
-      default: "arm64"
     - name: winArtifactType
       type: string
       description: OCI artifact type for Windows content
@@ -40,10 +36,6 @@ spec:
       type: string
       description: Platform OS for Windows artifacts
       default: "windows"
-    - name: winPlatformArch
-      type: string
-      description: Platform architecture for Windows artifacts
-      default: "amd64"
     - name: caTrustConfigMapName
       type: string
       description: The name of the ConfigMap to read CA bundle data from
@@ -56,17 +48,15 @@ spec:
     - name: result
       description: Success if the task succeeds, the error otherwise
     - name: has_mac_content
-      description: "true" if macOS content was found, "false" otherwise
+      description: true if macOS content was found, false otherwise
     - name: has_windows_content
-      description: "true" if Windows content was found, "false" otherwise
+      description: true if Windows content was found, false otherwise
     - name: components_metadata
-      description: JSON array with per-component metadata (pullspecs, platform info)
-    - name: mac_pullspec
-      description: Mac pullspec for first component (for simple pipeline usage)
-    - name: win_pullspec
-      description: Windows pullspec for first component (for simple pipeline usage)
-    - name: component_name
-      description: Name of first component (for simple pipeline usage)
+      description: JSON array with per-component metadata (pullspecs for all arches)
+    - name: mac_artifacts
+      description: JSON array of all macOS artifacts [{arch, pullspec, component}]
+    - name: win_artifacts
+      description: JSON array of all Windows artifacts [{arch, pullspec, component}]
   volumes:
     - name: workdir
       emptyDir: {}
@@ -90,9 +80,6 @@ spec:
         readOnly: true
 
   steps:
-    # =========================================================================
-    # Step 1: Inspect OCI manifests and extract metadata
-    # =========================================================================
     - name: inspect-artifacts
       image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
       computeResources:
@@ -113,14 +100,10 @@ spec:
           value: "$(params.macArtifactType)"
         - name: "MAC_PLATFORM_OS"
           value: "$(params.macPlatformOS)"
-        - name: "MAC_PLATFORM_ARCH"
-          value: "$(params.macPlatformArch)"
         - name: "WIN_ARTIFACT_TYPE"
           value: "$(params.winArtifactType)"
         - name: "WIN_PLATFORM_OS"
           value: "$(params.winPlatformOS)"
-        - name: "WIN_PLATFORM_ARCH"
-          value: "$(params.winPlatformArch)"
       script: |
         #!/usr/bin/env bash
         set -e
@@ -157,8 +140,10 @@ spec:
         HAS_MAC="false"
         HAS_WINDOWS="false"
 
-        # Initialize components metadata array
+        # Initialize components metadata array and global artifact arrays
         COMPONENTS_METADATA="[]"
+        ALL_MAC_ARTIFACTS="[]"
+        ALL_WIN_ARTIFACTS="[]"
 
         NUM_COMPONENTS=$(jq '.components | length' <<< "$SNAPSHOT_JSON")
 
@@ -201,41 +186,54 @@ spec:
             MEDIA_TYPE=$(jq -r '.mediaType // .schemaVersion' <<< "$MANIFEST")
             echo "Manifest media type: $MEDIA_TYPE"
             
-            MAC_DIGEST=""
-            WIN_DIGEST=""
-            MAC_PULLSPEC=""
-            WIN_PULLSPEC=""
+            # Initialize per-component artifact arrays
+            MAC_ARTIFACTS="[]"
+            WIN_ARTIFACTS="[]"
             
             if [[ "$MEDIA_TYPE" == *"manifest.list"* ]] || [[ "$MEDIA_TYPE" == *"image.index"* ]]; then
-                # Multi-platform manifest - find platform-specific digests
-                echo "Multi-platform manifest detected"
+                # Multi-platform manifest - auto-discover ALL platform-specific artifacts
+                echo "Multi-platform manifest detected - auto-discovering all platforms..."
                 
-                # Find macOS artifact
-                MAC_DIGEST=$(jq -r --arg type "$MAC_ARTIFACT_TYPE" --arg os "$MAC_PLATFORM_OS" --arg arch "$MAC_PLATFORM_ARCH" \
-                    '.manifests[] | select(
+                # Find ALL macOS artifacts (any architecture)
+                MAC_ARTIFACTS=$(jq -c --arg type "$MAC_ARTIFACT_TYPE" --arg os "$MAC_PLATFORM_OS" --arg base "$OCI_BASE" \
+                    '[.manifests[] | select(
                         (.artifactType == $type or .annotations["org.opencontainers.image.type"] == $type) and 
-                        .platform.os == $os and 
-                        .platform.architecture == $arch
-                    ) | .digest' <<< "$MANIFEST" | head -1)
+                        .platform.os == $os
+                    ) | {
+                        arch: .platform.architecture,
+                        pullspec: ($base + "@" + .digest)
+                    }]' <<< "$MANIFEST")
                 
-                # Find Windows artifact
-                WIN_DIGEST=$(jq -r --arg type "$WIN_ARTIFACT_TYPE" --arg os "$WIN_PLATFORM_OS" --arg arch "$WIN_PLATFORM_ARCH" \
-                    '.manifests[] | select(
+                # Find ALL Windows artifacts (any architecture)
+                WIN_ARTIFACTS=$(jq -c --arg type "$WIN_ARTIFACT_TYPE" --arg os "$WIN_PLATFORM_OS" --arg base "$OCI_BASE" \
+                    '[.manifests[] | select(
                         (.artifactType == $type or .annotations["org.opencontainers.image.type"] == $type) and 
-                        .platform.os == $os and 
-                        .platform.architecture == $arch
-                    ) | .digest' <<< "$MANIFEST" | head -1)
+                        .platform.os == $os
+                    ) | {
+                        arch: .platform.architecture,
+                        pullspec: ($base + "@" + .digest)
+                    }]' <<< "$MANIFEST")
                 
-                if [ -n "$MAC_DIGEST" ] && [ "$MAC_DIGEST" != "null" ]; then
-                    MAC_PULLSPEC="${OCI_BASE}@${MAC_DIGEST}"
+                # Check if any macOS artifacts found
+                MAC_COUNT=$(jq 'length' <<< "$MAC_ARTIFACTS")
+                if [ "$MAC_COUNT" -gt 0 ]; then
                     HAS_MAC="true"
-                    echo "Found macOS artifact: $MAC_PULLSPEC"
+                    echo "Found $MAC_COUNT macOS artifact(s):"
+                    jq -r '.[] | "  - \(.arch): \(.pullspec)"' <<< "$MAC_ARTIFACTS"
+                    # Add to global array with component name
+                    ALL_MAC_ARTIFACTS=$(jq --arg name "$COMPONENT_NAME" --argjson artifacts "$MAC_ARTIFACTS" \
+                        '. + [$artifacts[] | . + {component: $name}]' <<< "$ALL_MAC_ARTIFACTS")
                 fi
                 
-                if [ -n "$WIN_DIGEST" ] && [ "$WIN_DIGEST" != "null" ]; then
-                    WIN_PULLSPEC="${OCI_BASE}@${WIN_DIGEST}"
+                # Check if any Windows artifacts found
+                WIN_COUNT=$(jq 'length' <<< "$WIN_ARTIFACTS")
+                if [ "$WIN_COUNT" -gt 0 ]; then
                     HAS_WINDOWS="true"
-                    echo "Found Windows artifact: $WIN_PULLSPEC"
+                    echo "Found $WIN_COUNT Windows artifact(s):"
+                    jq -r '.[] | "  - \(.arch): \(.pullspec)"' <<< "$WIN_ARTIFACTS"
+                    # Add to global array with component name
+                    ALL_WIN_ARTIFACTS=$(jq --arg name "$COMPONENT_NAME" --argjson artifacts "$WIN_ARTIFACTS" \
+                        '. + [$artifacts[] | . + {component: $name}]' <<< "$ALL_WIN_ARTIFACTS")
                 fi
             else
                 # Single platform manifest - check content
@@ -249,21 +247,17 @@ spec:
                 echo "Single manifest - will be used by signing tasks to determine platform content"
             fi
             
-            # Add component metadata to array
+            # Add component metadata to array (now with artifact arrays)
             COMPONENT_META=$(jq -n \
                 --arg name "$COMPONENT_NAME" \
                 --arg pullspec "$PULLSPEC" \
-                --arg mac_pullspec "$MAC_PULLSPEC" \
-                --arg win_pullspec "$WIN_PULLSPEC" \
-                --arg mac_digest "$MAC_DIGEST" \
-                --arg win_digest "$WIN_DIGEST" \
+                --argjson mac_artifacts "$MAC_ARTIFACTS" \
+                --argjson win_artifacts "$WIN_ARTIFACTS" \
                 '{
                     name: $name,
                     pullspec: $pullspec,
-                    mac_pullspec: (if $mac_pullspec == "" then null else $mac_pullspec end),
-                    win_pullspec: (if $win_pullspec == "" then null else $win_pullspec end),
-                    mac_digest: (if $mac_digest == "" or $mac_digest == "null" then null else $mac_digest end),
-                    win_digest: (if $win_digest == "" or $win_digest == "null" then null else $win_digest end)
+                    mac_artifacts: $mac_artifacts,
+                    win_artifacts: $win_artifacts
                 }')
             
             COMPONENTS_METADATA=$(jq --argjson meta "$COMPONENT_META" '. + [$meta]' <<< "$COMPONENTS_METADATA")
@@ -275,6 +269,21 @@ spec:
         echo "=== Summary ==="
         echo "Has macOS content: $HAS_MAC"
         echo "Has Windows content: $HAS_WINDOWS"
+        
+        MAC_TOTAL=$(jq 'length' <<< "$ALL_MAC_ARTIFACTS")
+        WIN_TOTAL=$(jq 'length' <<< "$ALL_WIN_ARTIFACTS")
+        echo "Total macOS artifacts: $MAC_TOTAL"
+        echo "Total Windows artifacts: $WIN_TOTAL"
+        
+        echo ""
+        echo "All macOS artifacts:"
+        jq '.' <<< "$ALL_MAC_ARTIFACTS"
+        
+        echo ""
+        echo "All Windows artifacts:"
+        jq '.' <<< "$ALL_WIN_ARTIFACTS"
+        
+        echo ""
         echo "Components metadata:"
         echo "$COMPONENTS_METADATA" | jq '.'
 
@@ -282,19 +291,9 @@ spec:
         echo -n "$HAS_MAC" > "$(results.has_mac_content.path)"
         echo -n "$HAS_WINDOWS" > "$(results.has_windows_content.path)"
         echo -n "$COMPONENTS_METADATA" > "$(results.components_metadata.path)"
-        
-        # Write simple results for first component (for pipeline usage)
-        FIRST_MAC_PULLSPEC=$(echo "$COMPONENTS_METADATA" | jq -r '.[0].mac_pullspec // ""')
-        FIRST_WIN_PULLSPEC=$(echo "$COMPONENTS_METADATA" | jq -r '.[0].win_pullspec // ""')
-        FIRST_COMPONENT_NAME=$(echo "$COMPONENTS_METADATA" | jq -r '.[0].name // "unknown"')
-        
-        echo -n "$FIRST_MAC_PULLSPEC" > "$(results.mac_pullspec.path)"
-        echo -n "$FIRST_WIN_PULLSPEC" > "$(results.win_pullspec.path)"
-        echo -n "$FIRST_COMPONENT_NAME" > "$(results.component_name.path)"
+        echo -n "$ALL_MAC_ARTIFACTS" > "$(results.mac_artifacts.path)"
+        echo -n "$ALL_WIN_ARTIFACTS" > "$(results.win_artifacts.path)"
 
         echo ""
-        echo "First component: $FIRST_COMPONENT_NAME"
-        echo "  Mac pullspec: $FIRST_MAC_PULLSPEC"
-        echo "  Win pullspec: $FIRST_WIN_PULLSPEC"
-        echo ""
-        echo "Inspection complete. Signing tasks can now pull directly using the pullspecs."
+        echo "Inspection complete. Use mac_artifacts/win_artifacts arrays for signing tasks."
+        echo "Component name available in each artifact object as 'component' field."

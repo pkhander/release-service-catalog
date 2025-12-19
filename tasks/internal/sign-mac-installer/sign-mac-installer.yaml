@@ -1,0 +1,380 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: sign-mac-installer
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.1.0"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Combined Tekton task to sign macOS .app bundles, create DMG installers,
+    and sign/notarize the DMG - all on the Mac VM with minimal data transfer.
+
+    This task uses two Mac VM users for security isolation:
+    - macos-signing: Has keychain access for code signing
+    - dmg-creator: Runs electron-builder without keychain access
+
+    Flow:
+    1. SSH as macos-signing: ORAS pull, sign .app
+    2. SSH as dmg-creator: Create DMG with electron-builder
+    3. SSH as macos-signing: Sign DMG, notarize, staple, ORAS push
+
+    Replaces the separate: sign-mac-app -> create-mac-dmg -> sign-mac-dmg pipeline
+  params:
+    - name: mac_artifacts
+      type: string
+      description: JSON array of macOS artifacts [{arch, pullspec, component}]
+    - name: outputRegistry
+      type: string
+      description: Registry to push signed artifacts to
+      default: quay.io/redhat-pending
+    - name: quaySecret
+      type: string
+      description: Secret containing Quay credentials for oras pull/push
+      default: quay-credentials
+    - name: macHostCredentials
+      type: string
+      description: Secret containing Mac host username and host for signing user
+      default: mac-host-credentials
+    - name: macSigningCredentials
+      type: string
+      description: Secret containing Mac signing credentials (keychain password, CSC_NAME, Apple ID, etc.)
+      default: mac-signing-credentials
+    - name: macSSHKey
+      type: string
+      description: Secret containing SSH private key for macos-signing user
+      default: mac-ssh-key
+    - name: dmgCreatorHostCredentials
+      type: string
+      description: Secret containing Mac host username and host for dmg-creator user
+      default: dmg-creator-host-credentials
+    - name: dmgCreatorSSHKey
+      type: string
+      description: Secret containing SSH private key for dmg-creator user
+      default: dmg-creator-ssh-key
+    - name: signerScriptPath
+      type: string
+      description: Path to mac_signer.py on the Mac VM
+      default: "/Users/macos-signing/mac_signer/mac_signer.py"
+    - name: workingDir
+      type: string
+      description: Working directory on the Mac VM (shared between users)
+      default: "/opt/signing-workspace"
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: result
+      description: Success if the task succeeds, the error otherwise
+    - name: signed_dmgs
+      description: JSON array of signed DMGs [{component, arch, signed_pullspec, dmg_name}]
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: quay-secret
+      secret:
+        secretName: $(params.quaySecret)
+        defaultMode: 0444
+    - name: mac-host-credentials
+      secret:
+        secretName: $(params.macHostCredentials)
+        defaultMode: 0444
+    - name: mac-signing-credentials
+      secret:
+        secretName: $(params.macSigningCredentials)
+        defaultMode: 0444
+    - name: mac-ssh-key
+      secret:
+        secretName: $(params.macSSHKey)
+        defaultMode: 0444
+    - name: dmg-creator-host-credentials
+      secret:
+        secretName: $(params.dmgCreatorHostCredentials)
+        defaultMode: 0444
+    - name: dmg-creator-ssh-key
+      secret:
+        secretName: $(params.dmgCreatorSSHKey)
+        defaultMode: 0444
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    securityContext:
+      runAsUser: 1001
+    volumeMounts:
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+
+  steps:
+    - name: sign-mac-installer
+      image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
+      computeResources:
+        limits:
+          memory: 512Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      volumeMounts:
+        - name: workdir
+          mountPath: /workdir
+        - name: quay-secret
+          mountPath: /mnt/quay-secret
+        - name: mac-host-credentials
+          mountPath: /mnt/mac-host-credentials
+        - name: mac-signing-credentials
+          mountPath: /mnt/mac-signing-credentials
+        - name: mac-ssh-key
+          mountPath: /mnt/mac-ssh-key
+        - name: dmg-creator-host-credentials
+          mountPath: /mnt/dmg-creator-host-credentials
+        - name: dmg-creator-ssh-key
+          mountPath: /mnt/dmg-creator-ssh-key
+      env:
+        - name: MAC_ARTIFACTS
+          value: "$(params.mac_artifacts)"
+        - name: OUTPUT_REGISTRY
+          value: "$(params.outputRegistry)"
+        - name: SIGNER_SCRIPT
+          value: "$(params.signerScriptPath)"
+        - name: WORKING_DIR
+          value: "$(params.workingDir)"
+        - name: TASK_RUN_UID
+          value: "$(context.taskRun.uid)"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        # Load secrets - Signing user
+        MAC_HOST=$(cat /mnt/mac-host-credentials/host)
+        MAC_USER=$(cat /mnt/mac-host-credentials/username)
+        CSC_NAME=$(cat /mnt/mac-signing-credentials/csc_name)
+        CSC_KEY_PASSWORD=$(cat /mnt/mac-signing-credentials/keychain_password)
+        APPLE_ID=$(cat /mnt/mac-signing-credentials/apple_id)
+        APPLE_APP_SPECIFIC_PASSWORD=$(cat /mnt/mac-signing-credentials/apple_app_specific_password)
+        APPLE_TEAM_ID=$(cat /mnt/mac-signing-credentials/apple_team_id)
+        QUAY_USER=$(cat /mnt/quay-secret/username)
+        QUAY_PASS=$(cat /mnt/quay-secret/password)
+
+        # Load secrets - DMG creator user
+        DMG_CREATOR_HOST=$(cat /mnt/dmg-creator-host-credentials/host)
+        DMG_CREATOR_USER=$(cat /mnt/dmg-creator-host-credentials/username)
+
+        set -x
+
+        STDERR_FILE=/tmp/stderr.txt
+        OUTPUT_FILE=/tmp/signer_output.txt
+
+        # Validate we have artifacts
+        ARTIFACT_COUNT=$(jq 'length' <<< "$MAC_ARTIFACTS")
+        if [ "$ARTIFACT_COUNT" -eq 0 ]; then
+            echo "ERROR: No macOS artifacts found in mac_artifacts array"
+            exit 1
+        fi
+
+        echo "Found $ARTIFACT_COUNT macOS artifact(s) to process"
+
+        exitfunc() {
+            local err=$1
+            local line=$2
+            local command="$3"
+            if [ "$err" -eq 0 ] ; then
+                echo -n "Success" > "$(results.result.path)"
+            else
+                echo "$0: ERROR '$command' failed at line $line - exited with status $err" \
+                  > "$(results.result.path)"
+                if [ -f "$STDERR_FILE" ] ; then
+                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                fi
+            fi
+            exit $err
+        }
+        trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
+
+        # Setup SSH keys for both users
+        mkdir -p ~/.ssh
+        cp /mnt/mac-ssh-key/mac_id_rsa ~/.ssh/id_rsa_signer
+        cp /mnt/dmg-creator-ssh-key/ssh-privatekey ~/.ssh/id_rsa_dmg_creator
+        chmod 600 ~/.ssh/id_rsa_signer ~/.ssh/id_rsa_dmg_creator
+
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        SSH_SIGNER="ssh $SSH_OPTS -i ~/.ssh/id_rsa_signer ${MAC_USER}@${MAC_HOST}"
+        SSH_DMG_CREATOR="ssh $SSH_OPTS -i ~/.ssh/id_rsa_dmg_creator ${DMG_CREATOR_USER}@${DMG_CREATOR_HOST}"
+
+        # Initialize output array
+        SIGNED_DMGS="[]"
+
+        # Loop over all artifacts
+        for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
+            ARTIFACT=$(jq -c ".[$i]" <<< "$MAC_ARTIFACTS")
+            MAC_PULLSPEC=$(jq -r '.pullspec' <<< "$ARTIFACT")
+            MAC_ARCH=$(jq -r '.arch' <<< "$ARTIFACT")
+            COMPONENT_NAME=$(jq -r '.component' <<< "$ARTIFACT")
+
+            echo ""
+            echo "========================================"
+            echo "Processing artifact $((i + 1))/$ARTIFACT_COUNT"
+            echo "Component: $COMPONENT_NAME"
+            echo "Arch: $MAC_ARCH"
+            echo "Pullspec: $MAC_PULLSPEC"
+            echo "========================================"
+
+            REMOTE_WORK_DIR="${WORKING_DIR}/${TASK_RUN_UID}/${COMPONENT_NAME}_${MAC_ARCH}"
+
+            # ============================================================
+            # STEP 1: SSH as macos-signing - ORAS pull and sign app
+            # ============================================================
+            echo ""
+            echo "=== STEP 1: Sign .app (as macos-signing) ==="
+
+            set +x
+            $SSH_SIGNER "
+                export CSC_NAME='$CSC_NAME'
+                export CSC_KEY_PASSWORD='$CSC_KEY_PASSWORD'
+                export QUAY_USER='$QUAY_USER'
+                export QUAY_PASS='$QUAY_PASS'
+
+                # Create workspace
+                mkdir -p '$REMOTE_WORK_DIR'
+                chmod 775 '$REMOTE_WORK_DIR'
+
+                $SIGNER_SCRIPT sign-app \
+                    --pullspec '$MAC_PULLSPEC' \
+                    --output-registry '$OUTPUT_REGISTRY' \
+                    --component '$COMPONENT_NAME' \
+                    --arch '$MAC_ARCH' \
+                    --work-dir '$REMOTE_WORK_DIR'
+            " 2>"$STDERR_FILE" | tee "$OUTPUT_FILE"
+            set -x
+
+            # Parse output for app path
+            SIGNED_APP_PATH=$(grep "^APP_PATH=" "$OUTPUT_FILE" | cut -d= -f2- | tr -d '\r\n')
+            echo "Signed app path: $SIGNED_APP_PATH"
+
+            if [ -z "$SIGNED_APP_PATH" ]; then
+                echo "ERROR: Could not get signed app path from signer script"
+                exit 1
+            fi
+
+            # ============================================================
+            # STEP 2: SSH as dmg-creator - Create DMG with electron-builder
+            # ============================================================
+            echo ""
+            echo "=== STEP 2: Create DMG (as dmg-creator) ==="
+
+            # Find upstream directory with package.json
+            FIND_CMD="find '$REMOTE_WORK_DIR' -name 'package.json' -type f | head -1 | xargs dirname"
+            PROJECT_DIR=$($SSH_DMG_CREATOR "$FIND_CMD" | tr -d '\r\n')
+
+            if [ -z "$PROJECT_DIR" ]; then
+                echo "ERROR: Could not find package.json in work directory"
+                exit 1
+            fi
+            echo "PROJECT_DIR: $PROJECT_DIR"
+
+            APP_NAME=$(basename "$SIGNED_APP_PATH")
+
+            # Map architecture to electron-builder flag
+            if [ "$MAC_ARCH" == "amd64" ]; then
+                ARCH_FLAG="--x64"
+            else
+                ARCH_FLAG="--${MAC_ARCH}"
+            fi
+
+            $SSH_DMG_CREATOR "
+                set -e
+                cd '$PROJECT_DIR'
+
+                APP_DIR=\$(dirname '$SIGNED_APP_PATH')
+                APP_RELATIVE_PATH=\$(realpath --relative-to='$PROJECT_DIR' \"\$APP_DIR\")
+
+                export TMPDIR=/tmp
+
+                # Require dmg-config.json from upstream
+                if [ ! -f dmg-config.json ]; then
+                    echo "ERROR: dmg-config.json not found in \$PROJECT_DIR"
+                    echo "The upstream project must provide a dmg-config.json for DMG creation"
+                    exit 1
+                fi
+
+                # Create DMG without signing (identity=null)
+                npx electron-builder --mac dmg $ARCH_FLAG \
+                    --prepackaged \"\$APP_RELATIVE_PATH/$APP_NAME\" \
+                    --config dmg-config.json \
+                    -c.mac.identity=null
+
+                ls -lh dist/*.dmg
+            " 2>>"$STDERR_FILE"
+
+            # Get DMG path
+            DMG_NAME=$($SSH_DMG_CREATOR "ls -1 '$PROJECT_DIR/dist/'*.dmg | head -1 | xargs basename" | tr -d '\r\n')
+            DMG_PATH="${PROJECT_DIR}/dist/${DMG_NAME}"
+
+            echo "DMG_NAME: $DMG_NAME"
+            echo "DMG_PATH: $DMG_PATH"
+
+            # ============================================================
+            # STEP 3: SSH as macos-signing - Sign, notarize, staple DMG
+            # ============================================================
+            echo ""
+            echo "=== STEP 3: Sign & notarize DMG (as macos-signing) ==="
+
+            set +x
+            $SSH_SIGNER "
+                export CSC_NAME='$CSC_NAME'
+                export CSC_KEY_PASSWORD='$CSC_KEY_PASSWORD'
+                export APPLE_ID='$APPLE_ID'
+                export APPLE_APP_SPECIFIC_PASSWORD='$APPLE_APP_SPECIFIC_PASSWORD'
+                export APPLE_TEAM_ID='$APPLE_TEAM_ID'
+                export QUAY_USER='$QUAY_USER'
+                export QUAY_PASS='$QUAY_PASS'
+
+                $SIGNER_SCRIPT sign-dmg \
+                    --dmg-path '$DMG_PATH' \
+                    --output-registry '$OUTPUT_REGISTRY' \
+                    --component '$COMPONENT_NAME'
+            " 2>"$STDERR_FILE" | tee "$OUTPUT_FILE"
+            set -x
+
+            # Parse output - script outputs signed artifact pullspec
+            SIGNED_PULLSPEC=$(grep "^PULLSPEC=" "$OUTPUT_FILE" | cut -d= -f2- | tr -d '\r\n')
+            if [ -z "$SIGNED_PULLSPEC" ]; then
+                # Fallback: last line
+                SIGNED_PULLSPEC=$(tail -1 "$OUTPUT_FILE" | tr -d '\r\n')
+            fi
+
+            echo "Signed DMG pullspec: $SIGNED_PULLSPEC"
+
+            # Add to output array
+            SIGNED_DMGS=$(jq -c \
+                --arg component "$COMPONENT_NAME" \
+                --arg arch "$MAC_ARCH" \
+                --arg signed_pullspec "$SIGNED_PULLSPEC" \
+                --arg dmg_name "$DMG_NAME" \
+                '. + [{component: $component, arch: $arch, signed_pullspec: $signed_pullspec, dmg_name: $dmg_name}]' \
+                <<< "$SIGNED_DMGS")
+
+            # Cleanup workspace
+            echo "Cleaning up workspace: $REMOTE_WORK_DIR"
+            $SSH_SIGNER "rm -rf '$REMOTE_WORK_DIR'" || true
+        done
+
+        echo ""
+        echo "========================================"
+        echo "sign-mac-installer complete"
+        echo "Processed $ARTIFACT_COUNT artifact(s)"
+        echo "========================================"
+        jq '.' <<< "$SIGNED_DMGS"
+
+        # Write results
+        echo -n "$SIGNED_DMGS" > "$(results.signed_dmgs.path)"

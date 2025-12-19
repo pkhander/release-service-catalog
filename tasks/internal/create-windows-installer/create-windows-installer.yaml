@@ -4,25 +4,22 @@ kind: Task
 metadata:
   name: create-windows-installer
   annotations:
-    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/pipelines.minVersion: "0.1.0"
     tekton.dev/tags: release
 spec:
   description: |-
     Tekton task to create Windows NSIS installer from signed binaries.
     
     This task:
-    - SSHs to the Windows VM (same as sign-windows-binaries for now)
+    - SSHs to the Windows VM (files already there from sign-windows-binaries)
     - Uses electron-builder to create NSIS installer from signed win-unpacked
     - Leaves unsigned installer on disk for sign-windows-installer task
     
     Part of the Windows signing pipeline: sign-windows-binaries -> create-windows-installer -> sign-windows-installer
   params:
-    - name: win_unpacked_path
+    - name: signed_binaries
       type: string
-      description: Path to the signed win-unpacked directory on Windows VM (from sign-windows-binaries)
-    - name: component_name
-      type: string
-      description: Name of the component being processed
+      description: JSON array of signed binaries [{component, arch, win_path}] from sign-windows-binaries
     - name: windowsCredentials
       type: string
       description: Secret containing Windows host credentials
@@ -31,10 +28,6 @@ spec:
       type: string
       description: Secret containing SSH private key for Windows host
       default: windows-ssh-key
-    - name: workingDir
-      type: string
-      description: Working directory on the Windows VM
-      default: "C:\\Users\\binary_signer\\signing"
     - name: caTrustConfigMapName
       type: string
       description: The name of the ConfigMap to read CA bundle data from
@@ -46,10 +39,8 @@ spec:
   results:
     - name: result
       description: Success if the task succeeds, the error otherwise
-    - name: installer_path
-      description: Path to the created installer on the Windows VM
-    - name: installer_name
-      description: Name of the installer file (e.g., "My App Setup 1.0.0.exe")
+    - name: created_installers
+      description: JSON array of created installers [{component, arch, win_path, installer_name}]
   volumes:
     - name: workdir
       emptyDir: {}
@@ -60,7 +51,7 @@ spec:
     - name: windows-ssh-key
       secret:
         secretName: $(params.windowsSSHKey)
-        defaultMode: 0400
+        defaultMode: 0444
     - name: trusted-ca
       configMap:
         name: $(params.caTrustConfigMapName)
@@ -93,15 +84,12 @@ spec:
         - name: windows-ssh-key
           mountPath: /mnt/windows-ssh-key
       env:
-        - name: WIN_UNPACKED_PATH
-          value: "$(params.win_unpacked_path)"
-        - name: COMPONENT_NAME
-          value: "$(params.component_name)"
-        - name: WORKING_DIR
-          value: "$(params.workingDir)"
+        - name: SIGNED_BINARIES
+          value: "$(params.signed_binaries)"
       script: |
         #!/usr/bin/env bash
         set -e
+        set -o pipefail
 
         # Load secrets
         WIN_HOST=$(cat /mnt/windows-credentials/host)
@@ -124,94 +112,146 @@ spec:
                     grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
                 fi
             fi
-            exit 0
+            exit $err
         }
         trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
 
         # Setup SSH
-        mkdir -p ~/.ssh
-        cp /mnt/windows-ssh-key/ssh-privatekey ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
+        mkdir -p /tekton/home/.ssh
+        cp /mnt/windows-ssh-key/windows_id_rsa /tekton/home/.ssh/id_rsa
+        chmod 600 /tekton/home/.ssh/id_rsa
         
         SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         SSH_CMD="ssh $SSH_OPTS ${WIN_USER}@${WIN_HOST}"
 
-        REMOTE_WORK_DIR="${WORKING_DIR}\\${COMPONENT_NAME}"
+        # Parse input array
+        BINARY_COUNT=$(jq 'length' <<< "$SIGNED_BINARIES")
+        echo "=== Creating installers for $BINARY_COUNT signed binary sets ==="
 
-        echo "=== Step 1: Verify signed binaries exist ==="
-        $SSH_CMD "
-            if (-not (Test-Path '$WIN_UNPACKED_PATH')) {
-                Write-Error 'Signed win-unpacked not found at: $WIN_UNPACKED_PATH'
+        # Initialize output array
+        CREATED_INSTALLERS="[]"
+
+        # Loop over each signed binary set
+        for i in $(seq 0 $((BINARY_COUNT - 1))); do
+            BINARY=$(jq -c ".[$i]" <<< "$SIGNED_BINARIES")
+            WIN_PATH=$(jq -r '.win_path' <<< "$BINARY")
+            WIN_ARCH=$(jq -r '.arch' <<< "$BINARY")
+            COMPONENT_NAME=$(jq -r '.component' <<< "$BINARY")
+
+            echo ""
+            echo "=== [$((i+1))/$BINARY_COUNT] Creating installer for $COMPONENT_NAME ($WIN_ARCH) ==="
+            echo "Win path: $WIN_PATH"
+
+            # Step 1: Verify signed binaries exist
+            echo "--- Step 1: Verify signed binaries ---"
+            $SSH_CMD "
+                if (-not (Test-Path '${WIN_PATH}\\win-unpacked')) {
+                    Write-Error 'Signed win-unpacked not found at: ${WIN_PATH}\\win-unpacked'
+                    exit 1
+                }
+                Write-Host 'Found signed binaries at: ${WIN_PATH}\\win-unpacked'
+                Get-ChildItem '${WIN_PATH}\\win-unpacked' -Recurse -Include '*.exe' | Select-Object -First 5 Name
+            " 2>"$STDERR_FILE"
+
+            # Step 2: Check for nsis-config.json
+            echo "--- Step 2: Check for nsis-config.json ---"
+            HAS_NSIS_CONFIG=$($SSH_CMD "
+                if (Test-Path '${WIN_PATH}\\nsis-config.json') {
+                    Write-Output 'true'
+                } else {
+                    Write-Output 'false'
+                }
+            " | tr -d '\r\n')
+            
+            echo "Has nsis-config.json: $HAS_NSIS_CONFIG"
+
+            # Step 3: Create NSIS installer with electron-builder
+            echo "--- Step 3: Create NSIS installer ---"
+            
+            # Determine arch flag
+            ARCH_FLAG="--x64"
+            if [ "$WIN_ARCH" == "arm64" ]; then
+                ARCH_FLAG="--arm64"
+            fi
+
+            # Build the electron-builder command
+            # Node.js should be in PATH on Windows VM
+            $SSH_CMD "
+                Set-Location '${WIN_PATH}'
+                
+                # Check if package.json exists (required by electron-builder)
+                if (-not (Test-Path 'package.json')) {
+                    Write-Error 'package.json not found in ${WIN_PATH}'
+                    exit 1
+                }
+                
+                # Check for nsis-config.json
+                \$configArg = ''
+                if (Test-Path 'nsis-config.json') {
+                    \$configArg = '--config nsis-config.json'
+                    Write-Host 'Using nsis-config.json:'
+                    Get-Content 'nsis-config.json'
+                } else {
+                    Write-Host 'WARNING: nsis-config.json not found, using defaults'
+                }
+                
+                Write-Host ''
+                Write-Host 'Running electron-builder...'
+                
+                # Run electron-builder
+                # --prepackaged points to the signed win-unpacked directory
+                # Disable code signing in electron-builder (we sign separately)
+                \$cmd = \"npx electron-builder --win nsis $ARCH_FLAG --prepackaged win-unpacked \$configArg -c.win.signAndEditExecutable=false\"
+                Write-Host \"Command: \$cmd\"
+                Invoke-Expression \$cmd
+                
+                if (\$LASTEXITCODE -ne 0) {
+                    Write-Error 'electron-builder failed'
+                    exit 1
+                }
+                
+                Write-Host ''
+                Write-Host 'Installer created:'
+                Get-ChildItem 'dist\\*.exe' | Format-Table Name, Length
+            " 2>&1 | tee /tmp/builder_output.txt
+
+            # Step 4: Get installer name
+            echo "--- Step 4: Get installer path ---"
+            INSTALLER_NAME=$($SSH_CMD "
+                \$installer = Get-ChildItem '${WIN_PATH}\\dist\\*Setup*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+                if (-not \$installer) {
+                    # Fallback: find any .exe in dist
+                    \$installer = Get-ChildItem '${WIN_PATH}\\dist\\*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+                }
+                if (\$installer) { 
+                    Write-Output \$installer.Name 
+                }
+            " | tr -d '\r\n')
+
+            if [ -z "$INSTALLER_NAME" ]; then
+                echo "ERROR: No installer .exe found in dist directory"
                 exit 1
-            }
-            Write-Host 'Found signed binaries at: $WIN_UNPACKED_PATH'
-            Get-ChildItem '$WIN_UNPACKED_PATH' -Recurse -Include '*.exe' | Select-Object Name
-        " 2>"$STDERR_FILE"
-
-        echo "=== Step 2: Find upstream directory ==="
-        # The upstream directory contains package.json needed by electron-builder
-        UPSTREAM_DIR=$($SSH_CMD "
-            \$packageJson = Get-ChildItem -Path '$REMOTE_WORK_DIR' -Recurse -Filter 'package.json' | Select-Object -First 1
-            if (\$packageJson) {
-                \$packageJson.Directory.FullName
-            }
-        " | tr -d '\r\n')
-        
-        echo "UPSTREAM_DIR: $UPSTREAM_DIR"
-        
-        if [ -z "$UPSTREAM_DIR" ]; then
-            echo "ERROR: Could not find package.json in work directory"
-            exit 1
-        fi
-
-        echo "=== Step 3: Create NSIS installer with electron-builder ==="
-        # Node.js paths on Windows VM
-        WIN_NODE_DIR='C:\Users\binary_signer\node-v20.10.0-win-x64'
-        
-        $SSH_CMD "
-            # Add Node.js to PATH
-            \$env:PATH = '$WIN_NODE_DIR;' + \$env:PATH
+            fi
             
-            Set-Location '$UPSTREAM_DIR'
+            INSTALLER_PATH="${WIN_PATH}\\dist\\${INSTALLER_NAME}"
             
-            # Get relative path from upstream to win-unpacked
-            \$winUnpackedRelative = [System.IO.Path]::GetRelativePath('$UPSTREAM_DIR', '$WIN_UNPACKED_PATH')
-            Write-Host \"WIN_UNPACKED_RELATIVE: \$winUnpackedRelative\"
-            
-            # Run electron-builder
-            # --prepackaged points to the signed win-unpacked directory
-            # Disable code signing in electron-builder (we sign separately)
-            Write-Host 'Running electron-builder...'
-            electron-builder --win nsis --x64 --prepackaged \$winUnpackedRelative --config.win.signAndEditExecutable=false
-            
-            Write-Host ''
-            Write-Host 'Installer created:'
-            Get-ChildItem 'dist\\*.exe'
-        " 2>>"$STDERR_FILE"
+            echo "INSTALLER_NAME: $INSTALLER_NAME"
+            echo "INSTALLER_PATH: $INSTALLER_PATH"
 
-        echo "=== Step 4: Get installer path ==="
-        # Find the Setup*.exe installer (not the unpacked exe)
-        INSTALLER_NAME=$($SSH_CMD "
-            \$installer = Get-ChildItem '$UPSTREAM_DIR\\dist\\*Setup*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not \$installer) {
-                # Fallback: find any .exe that's not the main app
-                \$installer = Get-ChildItem '$UPSTREAM_DIR\\dist\\*.exe' | Where-Object { \$_.Name -notmatch '^[^-]+\.exe$' } | Select-Object -First 1
-            }
-            if (\$installer) { \$installer.Name }
-        " | tr -d '\r\n')
-        
-        INSTALLER_PATH="${UPSTREAM_DIR}\\dist\\${INSTALLER_NAME}"
-        
-        echo "INSTALLER_NAME: $INSTALLER_NAME"
-        echo "INSTALLER_PATH: $INSTALLER_PATH"
-
-        # Write results
-        echo -n "$INSTALLER_PATH" > "$(results.installer_path.path)"
-        echo -n "$INSTALLER_NAME" > "$(results.installer_name.path)"
+            # Add to output array
+            CREATED_INSTALLERS=$(jq -c \
+                --arg component "$COMPONENT_NAME" \
+                --arg arch "$WIN_ARCH" \
+                --arg win_path "$WIN_PATH" \
+                --arg installer_name "$INSTALLER_NAME" \
+                '. + [{component: $component, arch: $arch, win_path: $win_path, installer_name: $installer_name}]' \
+                <<< "$CREATED_INSTALLERS")
+        done
 
         echo ""
         echo "=== Create-windows-installer complete ==="
-        echo "Installer path: $INSTALLER_PATH"
-        echo "Installer name: $INSTALLER_NAME"
+        echo "Created $BINARY_COUNT installers:"
+        jq '.' <<< "$CREATED_INSTALLERS"
 
-
+        # Write results
+        echo -n "$CREATED_INSTALLERS" > "$(results.created_installers.path)"

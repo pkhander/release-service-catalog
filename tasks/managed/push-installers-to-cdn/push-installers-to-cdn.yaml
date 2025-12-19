@@ -175,15 +175,6 @@ spec:
           QUAY_URL="quay.io/konflux-artifacts/nonprod"
         fi
 
-        REQUESTTYPE=$(jq -r '.requestType // "internal-request"' "${DATA_FILE}")
-        if [ "${REQUESTTYPE}" == "internal-pipelinerun" ] ; then
-          requestType=internal-pipelinerun
-          requestK8sType=pipelinerun
-        else
-          requestType=internal-request
-          requestK8sType=internalrequest
-        fi
-
         snapshot=$(jq -c '.' "$(params.dataDir)/$(params.snapshotPath)")
         env=$(jq -r '.cdn.env' "$(params.dataDir)/$(params.dataPath)")
         AUTHOR=$(jq -r '.status.attribution.author' "$(params.dataDir)/$(params.releasePath)")
@@ -210,9 +201,12 @@ spec:
         cgwHostname="https://developers.redhat.com/content-gateway/rest/admin"
         cgwSecret="cgw-service-account-prod-secret"
 
+        requestType=internal-request
+        requestK8sType=internalrequest
+
         echo "Creating ${requestType} to push installers to CDN..."
 
-        ${requestType} --pipeline "${REQUEST}" \
+        internal-request --pipeline "${REQUEST}" \
           -p snapshot_json="${snapshot}" \
           -p author="${AUTHOR}" \
           -p signingKeyName="${signingKeyName}" \

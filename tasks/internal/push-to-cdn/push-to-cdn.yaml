@@ -4,34 +4,30 @@ kind: Task
 metadata:
   name: push-to-cdn
   annotations:
-    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/pipelines.minVersion: "0.1.0"
     tekton.dev/tags: release
 spec:
   description: |-
     Tekton task to push artifacts to CDN and Developer Portal.
     
-    This task supports multiple targets based on snapshot data:
-    - Exodus CDN (exodus-rsync) for Developer Portal
-    - Pulp for Customer Portal
-    - Content Gateway (CGW) for metadata publishing
-    
-    It reads signed artifacts and checksums from workspace and pushes to CDN.
+    This task:
+    - SCPs signed files from Mac/Windows VMs to local emptyDir
+    - Pushes to Exodus CDN (exodus-rsync) for file hosting
+    - Publishes to Content Gateway (CGW) for metadata on developers.redhat.com
   params:
     - name: snapshot_json
       type: string
       description: String containing a JSON representation of the snapshot spec
+    - name: signed_artifacts
+      type: string
+      description: JSON array of signed artifacts from signing tasks
+      default: "[]"
     - name: exodusGwSecret
       type: string
       description: Env specific secret containing the Exodus Gateway configs
     - name: exodusGwEnv
       type: string
       description: Environment to use in the Exodus Gateway. Options are [live, pre]
-    - name: pulpSecret
-      type: string
-      description: Env specific secret containing the rhsm-pulp credentials
-    - name: udcacheSecret
-      type: string
-      description: Env specific secret containing the udcache credentials
     - name: cgwHostname
       type: string
       description: Env specific hostname for content gateway
@@ -39,6 +35,22 @@ spec:
     - name: cgwSecret
       type: string
       description: Env specific secret containing the content gateway credentials
+    - name: macHostCredentials
+      type: string
+      description: Secret containing Mac host username and host
+      default: mac-host-credentials
+    - name: macSSHKey
+      type: string
+      description: Secret containing SSH private key for Mac host
+      default: mac-ssh-key
+    - name: windowsCredentials
+      type: string
+      description: Secret containing Windows host username and host
+      default: windows-credentials
+    - name: windowsSSHKey
+      type: string
+      description: Secret containing SSH private key for Windows host
+      default: windows-ssh-key
     - name: caTrustConfigMapName
       type: string
       description: The name of the ConfigMap to read CA bundle data from
@@ -53,22 +65,36 @@ spec:
     - name: publishedFiles
       description: List of published files
   volumes:
+    - name: workdir
+      emptyDir: {}
     - name: exodus-gw-secret
       secret:
         secretName: $(params.exodusGwSecret)
-        defaultMode: 0444
-    - name: pulp-secret
-      secret:
-        secretName: $(params.pulpSecret)
-        defaultMode: 0444
-    - name: udcache-secret
-      secret:
-        secretName: $(params.udcacheSecret)
         defaultMode: 0444
     - name: cgw-secret
       secret:
         secretName: $(params.cgwSecret)
         defaultMode: 0444
+    - name: mac-host-credentials
+      secret:
+        secretName: $(params.macHostCredentials)
+        defaultMode: 0444
+        optional: true
+    - name: mac-ssh-key
+      secret:
+        secretName: $(params.macSSHKey)
+        defaultMode: 0444
+        optional: true
+    - name: windows-credentials
+      secret:
+        secretName: $(params.windowsCredentials)
+        defaultMode: 0444
+        optional: true
+    - name: windows-ssh-key
+      secret:
+        secretName: $(params.windowsSSHKey)
+        defaultMode: 0444
+        optional: true
     - name: trusted-ca
       configMap:
         name: $(params.caTrustConfigMapName)
@@ -76,20 +102,17 @@ spec:
           - key: $(params.caTrustConfigMapKey)
             path: ca-bundle.crt
         optional: true
-  workspaces:
-    - name: data
-      description: Workspace containing artifacts to push
   stepTemplate:
-    securityContext:
-      runAsUser: 1001
     volumeMounts:
+      - name: workdir
+        mountPath: /var/workdir
       - name: trusted-ca
         mountPath: /mnt/trusted-ca
         readOnly: true
-
   steps:
     - name: push-artifacts
       image: quay.io/konflux-ci/release-service-utils:d26b427ea3024a0bd0e8dafb996bba3570760e00
+      workingDir: /var/workdir
       computeResources:
         limits:
           memory: 512Mi
@@ -99,36 +122,54 @@ spec:
       volumeMounts:
         - name: exodus-gw-secret
           mountPath: /mnt/exodusGwSecret
-        - name: pulp-secret
-          mountPath: /mnt/pulpSecret
-        - name: udcache-secret
-          mountPath: /mnt/udcacheSecret
         - name: cgw-secret
           mountPath: /mnt/cgwSecret
+        - name: mac-host-credentials
+          mountPath: /mnt/mac-host-credentials
+        - name: mac-ssh-key
+          mountPath: /mnt/mac-ssh-key
+        - name: windows-credentials
+          mountPath: /mnt/windows-credentials
+        - name: windows-ssh-key
+          mountPath: /mnt/windows-ssh-key
       env:
         - name: "SNAPSHOT_JSON"
           value: "$(params.snapshot_json)"
+        - name: "SIGNED_ARTIFACTS"
+          value: "$(params.signed_artifacts)"
       script: |
         #!/usr/bin/env bash
         set -e
 
+        # Load secrets
         EXODUS_CERT="$(cat /mnt/exodusGwSecret/cert)"
         EXODUS_KEY="$(cat /mnt/exodusGwSecret/key)"
         EXODUS_URL="$(cat /mnt/exodusGwSecret/url)"
-        PULP_URL="$(cat /mnt/pulpSecret/pulp_url)"
-        PULP_CERT="$(cat /mnt/pulpSecret/konflux-release-rhsm-pulp.crt)"
-        PULP_KEY="$(cat /mnt/pulpSecret/konflux-release-rhsm-pulp.key)"
-        UDC_URL="$(cat /mnt/udcacheSecret/url)"
-        UDC_CERT="$(cat /mnt/udcacheSecret/cert)"
-        UDC_KEY="$(cat /mnt/udcacheSecret/key)"
         CGW_USERNAME="$(cat /mnt/cgwSecret/username)"
         CGW_PASSWORD="$(cat /mnt/cgwSecret/token)"
+
+        # Try to load Mac credentials (optional)
+        MAC_HOST=""
+        MAC_USER=""
+        if [ -f /mnt/mac-host-credentials/host ]; then
+            MAC_HOST=$(cat /mnt/mac-host-credentials/host)
+            MAC_USER=$(cat /mnt/mac-host-credentials/username)
+        fi
+
+        # Try to load Windows credentials (optional)
+        WIN_HOST=""
+        WIN_USER=""
+        if [ -f /mnt/windows-credentials/host ]; then
+            WIN_HOST=$(cat /mnt/windows-credentials/host)
+            WIN_USER=$(cat /mnt/windows-credentials/username)
+        fi
 
         export CGW_USERNAME CGW_PASSWORD
 
         set -x
 
         STDERR_FILE=/tmp/stderr.txt
+        CONTENT_DIR=/var/workdir/artifacts
 
         exitfunc() {
             local err=$1
@@ -147,34 +188,113 @@ spec:
         }
         trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
 
+        # Setup SSH
+        mkdir -p /tekton/home/.ssh
+
+        # Setup Mac SSH if credentials exist
+        if [ -f /mnt/mac-ssh-key/mac_id_rsa ]; then
+            cp /mnt/mac-ssh-key/mac_id_rsa /tekton/home/.ssh/mac_id_rsa
+            chmod 600 /tekton/home/.ssh/mac_id_rsa
+        fi
+
+        # Setup Windows SSH if credentials exist
+        if [ -f /mnt/windows-ssh-key/windows_id_rsa ]; then
+            cp /mnt/windows-ssh-key/windows_id_rsa /tekton/home/.ssh/windows_id_rsa
+            chmod 600 /tekton/home/.ssh/windows_id_rsa
+        fi
+
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
         # Setup required variables
         export EXODUS_GW_CERT=/tmp/exodus.crt
         export EXODUS_GW_KEY=/tmp/exodus.key
         EXODUS_CONF_PATH=/tmp/exodus-rsync.conf
-        export PULP_CERT_FILE=/tmp/pulp.crt
-        export PULP_KEY_FILE=/tmp/pulp.key
-        export UDCACHE_CERT=/tmp/udc.crt
-        export UDCACHE_KEY=/tmp/udc.key
         EXODUS_GW_ENV=$(params.exodusGwEnv)
         export EXODUS_GW_ENV
         export EXODUS_GW_URL="$EXODUS_URL"
-        export EXODUS_PULP_HOOK_ENABLED=True
         export EXODUS_GW_TIMEOUT=7200
 
         set +x
         echo "$EXODUS_CERT" > "$EXODUS_GW_CERT"
         echo "$EXODUS_KEY" > "$EXODUS_GW_KEY"
-        echo "$PULP_CERT" > "$PULP_CERT_FILE"
-        echo "$PULP_KEY" > "$PULP_KEY_FILE"
-        echo "$UDC_CERT" > "$UDCACHE_CERT"
-        echo "$UDC_KEY" > "$UDCACHE_KEY"
         set -x
 
-        CONTENT_DIR="$(workspaces.data.path)/artifacts"
+        mkdir -p "$CONTENT_DIR"
 
-        # Save the results - list all files from all component directories
-        find "${CONTENT_DIR}" -type f -exec basename {} \; 2>/dev/null \
+        # Parse signed artifacts from upstream signing tasks
+        echo "=== Signed artifacts received ==="
+        echo "$SIGNED_ARTIFACTS" | jq .
+
+        # Save the results - list all signed artifact names
+        jq -r '.[].name // .[].dmg_name // .[].installer_name // empty' <<< "$SIGNED_ARTIFACTS" \
           | tail -c 512 | tee "$(results.publishedFiles.path)"
+
+        # =======================================================================
+        # Download artifacts from VMs
+        # Supports both Mac (mac_path, dmg_name) and Windows (win_path, installer_name)
+        # =======================================================================
+        echo "=== Downloading signed artifacts from VMs ==="
+        ARTIFACT_COUNT=$(jq 'length' <<< "$SIGNED_ARTIFACTS")
+        for i in $(seq 0 $((ARTIFACT_COUNT - 1))); do
+            ARTIFACT=$(jq -c ".[$i]" <<< "$SIGNED_ARTIFACTS")
+            COMPONENT=$(jq -r '.component' <<< "$ARTIFACT")
+            ARCH=$(jq -r '.arch' <<< "$ARTIFACT")
+            
+            # Determine if Mac or Windows artifact
+            MAC_PATH=$(jq -r '.mac_path // empty' <<< "$ARTIFACT")
+            WIN_PATH=$(jq -r '.win_path // empty' <<< "$ARTIFACT")
+            
+            # Get file name - handle both mac (dmg_name) and windows (installer_name)
+            FILE_NAME=$(jq -r '.dmg_name // .installer_name // .name // empty' <<< "$ARTIFACT")
+            
+            if [ -z "$FILE_NAME" ]; then
+                echo "ERROR: No file name found in artifact: $ARTIFACT"
+                exit 1
+            fi
+            
+            # Create component directory
+            COMPONENT_DIR="$CONTENT_DIR/$COMPONENT/$ARCH"
+            mkdir -p "$COMPONENT_DIR"
+            LOCAL_PATH="$COMPONENT_DIR/$FILE_NAME"
+            
+            echo "--- Downloading: $FILE_NAME ---"
+            
+            if [ -n "$MAC_PATH" ] && [ -n "$MAC_HOST" ]; then
+                # Download from Mac VM
+                echo "Source: Mac VM at ${MAC_USER}@${MAC_HOST}:${MAC_PATH}"
+                echo "To: $LOCAL_PATH"
+                
+                # Escape spaces in remote path for SCP
+                ESCAPED_PATH=$(printf '%s' "$MAC_PATH" | sed 's/ /\\ /g')
+                scp $SSH_OPTS -i /tekton/home/.ssh/mac_id_rsa "${MAC_USER}@${MAC_HOST}:${ESCAPED_PATH}" "$LOCAL_PATH"
+                
+            elif [ -n "$WIN_PATH" ] && [ -n "$WIN_HOST" ]; then
+                # Download from Windows VM
+                # Windows path format: C:\Users\...\dist\installer.exe
+                # Convert to cygdrive format for SCP: /cygdrive/c/Users/.../dist/installer.exe
+                WIN_PATH_UNIX=$(echo "$WIN_PATH" | sed 's|\\|/|g' | sed 's|^\([A-Za-z]\):|/cygdrive/\L\1|')
+                INSTALLER_REMOTE_PATH="${WIN_PATH_UNIX}/dist/${FILE_NAME}"
+                
+                echo "Source: Windows VM at ${WIN_USER}@${WIN_HOST}:${INSTALLER_REMOTE_PATH}"
+                echo "To: $LOCAL_PATH"
+                
+                scp $SSH_OPTS -i /tekton/home/.ssh/windows_id_rsa "${WIN_USER}@${WIN_HOST}:${INSTALLER_REMOTE_PATH}" "$LOCAL_PATH"
+            else
+                echo "ERROR: Cannot determine source VM for artifact. MAC_PATH='$MAC_PATH', WIN_PATH='$WIN_PATH'"
+                exit 1
+            fi
+            
+            if [ ! -f "$LOCAL_PATH" ]; then
+                echo "ERROR: Failed to download $FILE_NAME"
+                exit 1
+            fi
+            ls -lh "$LOCAL_PATH"
+            
+            # Update SIGNED_ARTIFACTS with local path for downstream functions
+            SIGNED_ARTIFACTS=$(jq -c --arg i "$i" --arg path "$LOCAL_PATH" \
+                '.[$i|tonumber].local_path = $path' <<< "$SIGNED_ARTIFACTS")
+        done
+        echo "=== All artifacts downloaded ===" 
 
         create_exodus_conf() {
           echo "Creating Exodus configuration file....."
@@ -194,73 +314,49 @@ spec:
           set -x
         }
 
-        push_component_to_pulp() {
+        # Get list of local files for a component from SIGNED_ARTIFACTS
+        get_component_files() {
           local component_name=$1
-          local component_dir="${CONTENT_DIR}/${component_name}"
-          
-          version=$(jq -cr --arg name "$component_name" '
-            .components[] | select(.name == $name) | .staged.version // ""
-          ' <<< "$SNAPSHOT_JSON")
-          
-          staged_destination=$(jq -cr --arg name "$component_name" '
-            .components[] | select(.name == $name) | .staged.destination // ""
-          ' <<< "$SNAPSHOT_JSON")
-          
-          if [[ -z "$version" || -z "$staged_destination" ]]; then
-            echo "Error: Pulp push requires both staged.version and staged.destination" \
-              "for component $component_name" >&2
-            exit 1
-          fi
-
-          echo "Pushing component $component_name to customer portal with pulp"
-          cd "$component_dir"
-          
-          staged_json='{"header":{"version": "0.2"},"payload":{"files":[]}}'
-          # shellcheck disable=SC2035
-          while IFS= read -r -d '' file ; do
-              staged_json=$(jq --arg filename "$(basename "$file")" --arg path "$file" \
-                --arg version "$version" \
-                '.payload.files[.payload.files | length] =
-                {"filename": $filename, "relative_path": $path, "version": $version}' <<< "$staged_json")
-          done < <(find * -type f -print0)
-          echo "$staged_json" | yq -P -I 4 > staged.yaml
-
-          pulp_push_wrapper --debug --source "$component_dir" --pulp-url "$PULP_URL" \
-            --pulp-cert $PULP_CERT_FILE --pulp-key $PULP_KEY_FILE --udcache-url "$UDC_URL"
-
-          rm -f staged.yaml
-          cd "$CONTENT_DIR"
+          jq -r --arg name "$component_name" '
+            .[] | select(.component == $name) | .local_path
+          ' <<< "$SIGNED_ARTIFACTS"
         }
 
         push_component_to_cdn() {
           local component_name=$1
-          local component_dir="${CONTENT_DIR}/${component_name}"
           
           echo "Pushing component $component_name to CDN with exodus-rsync"
           create_exodus_conf
           prefix="exodus:/content/origin/files/sha256"
           
-          cd "$component_dir"
-          # shellcheck disable=SC2035
-          while IFS= read -r -d '' file; do
+          # Use explicit file list from signed_artifacts
+          while IFS= read -r file_path; do
+            [ -z "$file_path" ] && continue
             set +x
-            file_name=$(basename "$file")
-            checksum=$(sha256sum "$file" | awk '{print $1}')
+            file_name=$(basename "$file_path")
+            checksum=$(sha256sum "$file_path" | awk '{print $1}')
             destination_path="$prefix/${checksum:0:2}/$checksum/$file_name"
             set -x
 
-            rsync --exodus-conf "$EXODUS_CONF_PATH" "$file" "$destination_path"
-          done < <(find * -type f -print0)
-          cd "$CONTENT_DIR"
+            echo "Pushing: $file_path -> $destination_path"
+            rsync --exodus-conf "$EXODUS_CONF_PATH" "$file_path" "$destination_path"
+          done < <(get_component_files "$component_name")
         }
 
         publish_component_to_cgw() {
           local component_name=$1
-          local component_dir="${CONTENT_DIR}/${component_name}"
+          
+          # Create a temp directory with just this component's files for CGW
+          local cgw_dir=$(mktemp -d)
+          
+          while IFS= read -r file_path; do
+            [ -z "$file_path" ] && continue
+            cp "$file_path" "$cgw_dir/"
+          done < <(get_component_files "$component_name")
           
           # Update contentDir for this component in SNAPSHOT_JSON
           SNAPSHOT_JSON=$(
-            jq --arg name "$component_name" --arg dir "$component_dir" '
+            jq --arg name "$component_name" --arg dir "$cgw_dir" '
               .components |= map(
                 if .name == $name and .contentGateway? then
                   .contentGateway.contentDir = $dir
@@ -277,27 +373,22 @@ spec:
         for ((c = 0; c < NUM_COMPONENTS; c++)); do
           COMPONENT=$(jq -c --arg i "$c" '.components[$i|tonumber]' <<< "$SNAPSHOT_JSON")
           COMPONENT_NAME=$(jq -r '.name' <<< "$COMPONENT")
-          
-          HAS_STAGED=$(jq -r '.staged | length > 0' <<< "$COMPONENT")
           HAS_CGW=$(jq -r '.contentGateway | length > 0' <<< "$COMPONENT")
 
-          echo "Processing component: $COMPONENT_NAME (staged=$HAS_STAGED, cgw=$HAS_CGW)"
+          echo "Processing component: $COMPONENT_NAME (cgw=$HAS_CGW)"
 
-          # Check if component directory exists and has files
-          COMPONENT_DIR="${CONTENT_DIR}/${COMPONENT_NAME}"
-          if [ ! -d "$COMPONENT_DIR" ] || [ -z "$(ls -A "$COMPONENT_DIR" 2>/dev/null)" ]; then
-            echo "Warning: No files found for component $COMPONENT_NAME, skipping..."
+          # Check if we have signed artifacts for this component
+          FILE_COUNT=$(jq --arg name "$COMPONENT_NAME" '[.[] | select(.component == $name)] | length' <<< "$SIGNED_ARTIFACTS")
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "Warning: No signed artifacts found for component $COMPONENT_NAME, skipping..."
             continue
           fi
+          echo "Found $FILE_COUNT signed artifact(s) for $COMPONENT_NAME"
 
-          if [[ "$HAS_STAGED" == "true" ]]; then
-            # Push to customer portal (pulp) - CDN push not needed when using pulp
-            push_component_to_pulp "$COMPONENT_NAME" 2> "$STDERR_FILE"
-          elif [[ "$HAS_CGW" == "true" ]]; then
-            # Only push to CDN when NOT pushing to pulp
-            push_component_to_cdn "$COMPONENT_NAME" > >(tee "$STDERR_FILE") 2>&1 || true
-          fi
+          # Push to CDN (exodus-rsync)
+          push_component_to_cdn "$COMPONENT_NAME" 2>&1 | tee "$STDERR_FILE"
           
+          # Prepare CGW metadata if configured
           if [[ "$HAS_CGW" == "true" ]]; then
             publish_component_to_cgw "$COMPONENT_NAME"
           fi

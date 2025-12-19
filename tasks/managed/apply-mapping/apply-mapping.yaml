@@ -399,10 +399,20 @@ spec:
             # Construct image reference with the first architecture's digest for annotations
             image_with_digest="${IMAGE_REF%@*}@${first_digest}"
 
-            # Get raw manifest to extract annotations
-            raw_manifest="$(skopeo inspect --retry-times 3 --no-tags --raw docker://"${image_with_digest}" | jq -c)"
-            annotations="$(jq -c '.annotations // {}' <<< "$raw_manifest")"
+        # Get raw manifest to extract annotations
+        raw_manifest="$(skopeo inspect --retry-times 3 --no-tags --raw docker://"${image_with_digest}" | jq -c)"
+        annotations="$(jq -c '.annotations // {}' <<< "$raw_manifest")"
 
+        # Check if this is a Konflux installer OCI artifact (not a container image)
+        artifact_type="$(jq -r '.artifactType // ""' <<< "$raw_manifest")"
+        if [[ "$artifact_type" == "application/vnd.konflux.detached-signing.v1" || \
+              "$artifact_type" == "application/vnd.konflux.unsigned-installer.v1" ]]; then
+            echo "Component ${NAME} is a Konflux installer artifact (${artifact_type}), skipping image metadata inspection"
+            image_metadata="{}"
+            build_date=""
+            env_variables="[]"
+            labels="{}"
+        else
             # Get image metadata for labels, env, build_date (standard inspect)
             image_metadata="$(skopeo inspect --retry-times 3 --no-tags \
               --override-os "${os}" --override-arch "${arch}" docker://"${IMAGE_REF}" | jq -c)"
@@ -410,6 +420,7 @@ spec:
             build_date="$(jq -r '.Labels."build-date" // .Created // ""' <<< "$image_metadata")"
             env_variables="$(jq -c '.Env // []' <<< "${image_metadata}")"
             labels="$(jq -c '.Labels // {}' <<< "${image_metadata}")"
+        fi
 
             # Get oci_version_raw from annotations, fallback to labels
             oci_version_raw="$(jq -r '.["org.opencontainers.image.version"] // ""' <<< "$annotations")"

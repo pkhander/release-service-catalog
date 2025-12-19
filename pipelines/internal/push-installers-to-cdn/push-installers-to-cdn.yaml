@@ -4,7 +4,7 @@ kind: Pipeline
 metadata:
   name: push-installers-to-cdn
   annotations:
-    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/pipelines.minVersion: "0.1.0"
     tekton.dev/tags: release
 spec:
   description: |-
@@ -13,9 +13,8 @@ spec:
     This pipeline:
     1. Inspects OCI artifacts to find platform-specific content
     2. Signs Mac .app, creates DMG, notarizes (3 tasks, Mac VM pulls directly via oras)
-    3. Signs Windows binaries, creates installer, signs installer (3 tasks, Windows VM pulls directly via oras)
-    4. Generates GPG-signed checksums
-    5. Pushes artifacts to Exodus CDN, Pulp, and Content Gateway
+    3. Signs Windows binaries, creates installer, signs installer (3 tasks, Tekton pulls via oras, SCPs to Windows)
+    4. Pushes artifacts to Exodus CDN and Content Gateway (developers.redhat.com)
   params:
     - name: snapshot_json
       type: string
@@ -26,12 +25,6 @@ spec:
     - name: exodusGwEnv
       type: string
       description: Environment to use in the Exodus Gateway. Options are [live, pre]
-    - name: pulpSecret
-      type: string
-      description: Env specific secret containing the rhsm-pulp credentials
-    - name: udcacheSecret
-      type: string
-      description: Env specific secret containing the udcache credentials
     - name: cgwHostname
       type: string
       description: The hostname of the content-gateway to publish the metadata to
@@ -56,7 +49,6 @@ spec:
       description: Quay URL of the repo where content will be shared between tasks
       type: string
       default: "quay.io/konflux-artifacts"
-    # Mac host params
     - name: macHostCredentials
       type: string
       description: Secret containing Mac host username and host
@@ -69,7 +61,6 @@ spec:
       type: string
       description: Secret containing SSH private key for Mac host
       default: mac-ssh-key
-    # Windows host params
     - name: windowsCredentials
       type: string
       description: Secret to interact with the Windows signing host
@@ -78,12 +69,9 @@ spec:
       type: string
       description: Secret containing SSH private key for the Windows signing host
       default: windows-ssh-key
-  workspaces:
-    - name: data
-      description: Workspace for sharing data between tasks
   results:
     - name: result
-      value: $(tasks.push-to-cdn.results.result)
+      value: $(tasks.sign-windows-installer.results.result)
   tasks:
     - name: extract-installer-payload
       timeout: "30m0s"
@@ -100,102 +88,98 @@ spec:
         - name: snapshot_json
           value: $(params.snapshot_json)
     # =========================================================================
-    # Mac Signing (3 tasks)
+    # Mac Signing (3 tasks) - TEMPORARILY DISABLED FOR WINDOWS TESTING
     #   - Sign .app
     #   - Create DMG from signed .app
     #   - Sign, notarize, staple signed DMG
     # =========================================================================
-    - name: sign-mac-app
-      timeout: "1h00m0s"
-      when:
-        - input: $(tasks.extract-installer-payload.results.has_mac_content)
-          operator: in
-          values: ["true"]
-      runAfter:
-        - extract-installer-payload
-      taskRef:
-        resolver: "git"
-        params:
-          - name: url
-            value: $(params.taskGitUrl)
-          - name: revision
-            value: $(params.taskGitRevision)
-          - name: pathInRepo
-            value: tasks/internal/sign-mac-app/sign-mac-app.yaml
-      params:
-        - name: mac_pullspec
-          value: $(tasks.extract-installer-payload.results.mac_pullspec)
-        - name: component_name
-          value: $(tasks.extract-installer-payload.results.component_name)
-        - name: macHostCredentials
-          value: $(params.macHostCredentials)
-        - name: macSigningCredentials
-          value: $(params.macSigningCredentials)
-        - name: macSSHKey
-          value: $(params.macSSHKey)
-        - name: quaySecret
-          value: quay-credentials
-    - name: create-mac-dmg
-      timeout: "30m0s"
-      when:
-        - input: $(tasks.extract-installer-payload.results.has_mac_content)
-          operator: in
-          values: ["true"]
-      runAfter:
-        - sign-mac-app
-      taskRef:
-        resolver: "git"
-        params:
-          - name: url
-            value: $(params.taskGitUrl)
-          - name: revision
-            value: $(params.taskGitRevision)
-          - name: pathInRepo
-            value: tasks/internal/create-mac-dmg/create-mac-dmg.yaml
-      params:
-        - name: signed_app_path
-          value: $(tasks.sign-mac-app.results.signed_app_path)
-        - name: component_name
-          value: $(tasks.extract-installer-payload.results.component_name)
-        - name: macHostCredentials
-          value: $(params.macHostCredentials)
-        - name: macSSHKey
-          value: $(params.macSSHKey)
-    - name: sign-mac-dmg
-      timeout: "2h00m0s"
-      when:
-        - input: $(tasks.extract-installer-payload.results.has_mac_content)
-          operator: in
-          values: ["true"]
-      runAfter:
-        - create-mac-dmg
-      taskRef:
-        resolver: "git"
-        params:
-          - name: url
-            value: $(params.taskGitUrl)
-          - name: revision
-            value: $(params.taskGitRevision)
-          - name: pathInRepo
-            value: tasks/internal/sign-mac-dmg/sign-mac-dmg.yaml
-      params:
-        - name: dmg_path
-          value: $(tasks.create-mac-dmg.results.dmg_path)
-        - name: component_name
-          value: $(tasks.extract-installer-payload.results.component_name)
-        - name: quayURL
-          value: $(params.quayURL)
-        - name: quaySecret
-          value: quay-credentials
-        - name: macHostCredentials
-          value: $(params.macHostCredentials)
-        - name: macSigningCredentials
-          value: $(params.macSigningCredentials)
-        - name: macSSHKey
-          value: $(params.macSSHKey)
+    # - name: sign-mac-app
+    #   timeout: "1h00m0s"
+    #   when:
+    #     - input: $(tasks.extract-installer-payload.results.has_mac_content)
+    #       operator: in
+    #       values: ["true"]
+    #   runAfter:
+    #     - extract-installer-payload
+    #   taskRef:
+    #     resolver: "git"
+    #     params:
+    #       - name: url
+    #         value: $(params.taskGitUrl)
+    #       - name: revision
+    #         value: $(params.taskGitRevision)
+    #       - name: pathInRepo
+    #         value: tasks/internal/sign-mac-app/sign-mac-app.yaml
+    #   params:
+    #     - name: mac_artifacts
+    #       value: $(tasks.extract-installer-payload.results.mac_artifacts)
+    #     - name: pipelineRunUid
+    #       value: $(context.pipelineRun.uid)
+    #     - name: macHostCredentials
+    #       value: $(params.macHostCredentials)
+    #     - name: macSigningCredentials
+    #       value: $(params.macSigningCredentials)
+    #     - name: macSSHKey
+    #       value: $(params.macSSHKey)
+    #     - name: quaySecret
+    #       value: quay-credentials
+    # - name: create-mac-dmg
+    #   timeout: "30m0s"
+    #   when:
+    #     - input: $(tasks.extract-installer-payload.results.has_mac_content)
+    #       operator: in
+    #       values: ["true"]
+    #   runAfter:
+    #     - sign-mac-app
+    #   taskRef:
+    #     resolver: "git"
+    #     params:
+    #       - name: url
+    #         value: $(params.taskGitUrl)
+    #       - name: revision
+    #         value: $(params.taskGitRevision)
+    #       - name: pathInRepo
+    #         value: tasks/internal/create-mac-dmg/create-mac-dmg.yaml
+    #   params:
+    #     - name: signed_apps
+    #       value: $(tasks.sign-mac-app.results.signed_apps)
+    #     - name: pipelineRunUid
+    #       value: $(context.pipelineRun.uid)
+    #     - name: quaySecret
+    #       value: quay-credentials
+    #     - name: macHostCredentials
+    #       value: $(params.macHostCredentials)
+    #     - name: macSSHKey
+    #       value: $(params.macSSHKey)
+    # - name: sign-mac-dmg
+    #   timeout: "2h00m0s"
+    #   when:
+    #     - input: $(tasks.extract-installer-payload.results.has_mac_content)
+    #       operator: in
+    #       values: ["true"]
+    #   runAfter:
+    #     - create-mac-dmg
+    #   taskRef:
+    #     resolver: "git"
+    #     params:
+    #       - name: url
+    #         value: $(params.taskGitUrl)
+    #       - name: revision
+    #         value: $(params.taskGitRevision)
+    #       - name: pathInRepo
+    #         value: tasks/internal/sign-mac-dmg/sign-mac-dmg.yaml
+    #   params:
+    #     - name: created_dmgs
+    #       value: $(tasks.create-mac-dmg.results.created_dmgs)
+    #     - name: macHostCredentials
+    #       value: $(params.macHostCredentials)
+    #     - name: macSigningCredentials
+    #       value: $(params.macSigningCredentials)
+    #     - name: macSSHKey
+    #       value: $(params.macSSHKey)
     # =========================================================================
     # Windows Signing (3 tasks)
-    #   - Sign binaries (.exe, .dll, .node)
+    #   - Sign binaries (.exe, .dll, .node) - Tekton pulls via oras, SCPs to Windows
     #   - Create NSIS installer from signed binaries
     #   - Sign the installer
     # =========================================================================
@@ -217,16 +201,14 @@ spec:
           - name: pathInRepo
             value: tasks/internal/sign-windows-binaries/sign-windows-binaries.yaml
       params:
-        - name: win_pullspec
-          value: $(tasks.extract-installer-payload.results.win_pullspec)
-        - name: component_name
-          value: $(tasks.extract-installer-payload.results.component_name)
+        - name: win_artifacts
+          value: $(tasks.extract-installer-payload.results.win_artifacts)
+        - name: pipelineRunUid
+          value: $(context.pipelineRun.uid)
         - name: windowsCredentials
           value: $(params.windowsCredentials)
         - name: windowsSSHKey
           value: $(params.windowsSSHKey)
-        - name: quaySecret
-          value: quay-credentials
     - name: create-windows-installer
       timeout: "30m0s"
       when:
@@ -245,10 +227,8 @@ spec:
           - name: pathInRepo
             value: tasks/internal/create-windows-installer/create-windows-installer.yaml
       params:
-        - name: win_unpacked_path
-          value: $(tasks.sign-windows-binaries.results.win_unpacked_path)
-        - name: component_name
-          value: $(tasks.extract-installer-payload.results.component_name)
+        - name: signed_binaries
+          value: $(tasks.sign-windows-binaries.results.signed_binaries)
         - name: windowsCredentials
           value: $(params.windowsCredentials)
         - name: windowsSSHKey
@@ -271,76 +251,39 @@ spec:
           - name: pathInRepo
             value: tasks/internal/sign-windows-installer/sign-windows-installer.yaml
       params:
-        - name: installer_path
-          value: $(tasks.create-windows-installer.results.installer_path)
-        - name: component_name
-          value: $(tasks.extract-installer-payload.results.component_name)
-        - name: quayURL
-          value: $(params.quayURL)
-        - name: quaySecret
-          value: quay-credentials
+        - name: created_installers
+          value: $(tasks.create-windows-installer.results.created_installers)
         - name: windowsCredentials
           value: $(params.windowsCredentials)
         - name: windowsSSHKey
           value: $(params.windowsSSHKey)
-    - name: generate-checksums
-      timeout: "30m0s"
-      runAfter:
-        - extract-installer-payload
-        # These runAfter ensure we wait for signing tasks if they run
-        # If they're skipped (when=false), this task still runs
-      taskRef:
-        resolver: "git"
-        params:
-          - name: url
-            value: $(params.taskGitUrl)
-          - name: revision
-            value: $(params.taskGitRevision)
-          - name: pathInRepo
-            value: tasks/internal/generate-checksums/generate-checksums.yaml
-      params:
-        # These will be empty strings if the signing tasks were skipped
-        - name: signed_mac_dmg_pullspec
-          value: $(tasks.sign-mac-dmg.results.signed_dmg_pullspec)
-        - name: signed_windows_installer_pullspec
-          value: $(tasks.sign-windows-installer.results.signed_installer_pullspec)
-        - name: component_name
-          value: $(tasks.extract-installer-payload.results.component_name)
-        - name: author
-          value: $(params.author)
-        - name: signingKeyName
-          value: $(params.signingKeyName)
-      workspaces:
-        - name: data
-          workspace: data
-    - name: push-to-cdn
-      timeout: "4h00m0s"
-      runAfter:
-        - generate-checksums
-      taskRef:
-        resolver: "git"
-        params:
-          - name: url
-            value: $(params.taskGitUrl)
-          - name: revision
-            value: $(params.taskGitRevision)
-          - name: pathInRepo
-            value: tasks/internal/push-to-cdn/push-to-cdn.yaml
-      params:
-        - name: snapshot_json
-          value: $(params.snapshot_json)
-        - name: exodusGwSecret
-          value: $(params.exodusGwSecret)
-        - name: exodusGwEnv
-          value: $(params.exodusGwEnv)
-        - name: pulpSecret
-          value: $(params.pulpSecret)
-        - name: udcacheSecret
-          value: $(params.udcacheSecret)
-        - name: cgwHostname
-          value: $(params.cgwHostname)
-        - name: cgwSecret
-          value: $(params.cgwSecret)
-      workspaces:
-        - name: data
-          workspace: data
+    # - name: push-to-cdn
+    #   timeout: "4h00m0s"
+    #   runAfter:
+    #     - sign-windows-installer
+    #   taskRef:
+    #     resolver: "git"
+    #     params:
+    #       - name: url
+    #         value: $(params.taskGitUrl)
+    #       - name: revision
+    #         value: $(params.taskGitRevision)
+    #       - name: pathInRepo
+    #         value: tasks/internal/push-to-cdn/push-to-cdn.yaml
+    #   params:
+    #     - name: snapshot_json
+    #       value: $(params.snapshot_json)
+    #     - name: signed_artifacts
+    #       value: $(tasks.sign-windows-installer.results.signed_installers)
+    #     - name: exodusGwSecret
+    #       value: $(params.exodusGwSecret)
+    #     - name: exodusGwEnv
+    #       value: $(params.exodusGwEnv)
+    #     - name: cgwHostname
+    #       value: $(params.cgwHostname)
+    #     - name: cgwSecret
+    #       value: $(params.cgwSecret)
+    #     - name: windowsCredentials
+    #       value: $(params.windowsCredentials)
+    #     - name: windowsSSHKey
+    #       value: $(params.windowsSSHKey)

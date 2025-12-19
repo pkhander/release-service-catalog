@@ -1,0 +1,278 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: sign-mac-dmg-v2
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.1.0"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to sign, notarize, and staple a macOS DMG installer.
+    
+    This task:
+    - SSHs to the static Mac signing VM
+    - Pulls unsigned DMG from OCI registry via oras
+    - Signs DMG with Developer ID
+    - Notarizes with Apple
+    - Staples notarization ticket
+    - Pushes signed DMG to OCI registry
+    
+    Accepts pullspec input (compatible with create-mac-dmg-v2).
+    Part of the mac signing pipeline: sign-mac-app -> create-mac-dmg-v2 -> sign-mac-dmg-v2
+  params:
+    - name: created_dmgs
+      type: string
+      description: JSON array of created DMGs [{component, arch, pullspec, dmg_name}] from create-mac-dmg-v2
+    - name: outputRegistry
+      type: string
+      description: Registry to push signed DMG to
+      default: quay.io/redhat-pending
+    - name: quaySecret
+      type: string
+      description: Secret containing Quay credentials for oras pull/push
+      default: quay-credentials
+    - name: macHostCredentials
+      type: string
+      description: Secret containing Mac host username and host
+      default: mac-host-credentials
+    - name: macSigningCredentials
+      type: string
+      description: Secret containing Mac signing credentials (keychain, Apple ID, etc.)
+      default: mac-signing-credentials
+    - name: macSSHKey
+      type: string
+      description: Secret containing SSH private key for Mac host
+      default: mac-ssh-key
+    - name: caTrustConfigMapName
+      type: string
+      description: The name of the ConfigMap to read CA bundle data from
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      type: string
+      description: The name of the key in the ConfigMap that contains the CA bundle data
+      default: ca-bundle.crt
+  results:
+    - name: result
+      description: Success if the task succeeds, the error otherwise
+    - name: signed_dmgs
+      description: JSON array of signed DMGs [{component, arch, pullspec, dmg_name}]
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: quay-secret
+      secret:
+        secretName: $(params.quaySecret)
+        defaultMode: 0444
+    - name: mac-host-credentials
+      secret:
+        secretName: $(params.macHostCredentials)
+        defaultMode: 0444
+    - name: mac-signing-credentials
+      secret:
+        secretName: $(params.macSigningCredentials)
+        defaultMode: 0444
+    - name: mac-ssh-key
+      secret:
+        secretName: $(params.macSSHKey)
+        defaultMode: 0444
+    - name: trusted-ca
+      configMap:
+        name: $(params.caTrustConfigMapName)
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        optional: true
+  stepTemplate:
+    securityContext:
+      runAsUser: 1001
+    volumeMounts:
+      - name: trusted-ca
+        mountPath: /mnt/trusted-ca
+        readOnly: true
+
+  steps:
+    - name: sign-notarize-dmg
+      image: quay.io/konflux-ci/release-service-utils:82012e03002128f2a226acb23dc5c6fc1c37f5b6
+      computeResources:
+        limits:
+          memory: 512Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      volumeMounts:
+        - name: workdir
+          mountPath: /workdir
+        - name: quay-secret
+          mountPath: /mnt/quay-secret
+        - name: mac-host-credentials
+          mountPath: /mnt/mac-host-credentials
+        - name: mac-signing-credentials
+          mountPath: /mnt/mac-signing-credentials
+        - name: mac-ssh-key
+          mountPath: /mnt/mac-ssh-key
+      env:
+        - name: CREATED_DMGS
+          value: "$(params.created_dmgs)"
+        - name: OUTPUT_REGISTRY
+          value: "$(params.outputRegistry)"
+      script: |
+        #!/usr/bin/env bash
+        set -e
+
+        # Load secrets
+        MAC_HOST=$(cat /mnt/mac-host-credentials/host)
+        MAC_USER=$(cat /mnt/mac-host-credentials/username)
+        CSC_NAME=$(cat /mnt/mac-signing-credentials/csc_name)
+        CSC_KEY_PASSWORD=$(cat /mnt/mac-signing-credentials/keychain_password)
+        APPLE_ID=$(cat /mnt/mac-signing-credentials/apple_id)
+        APPLE_APP_SPECIFIC_PASSWORD=$(cat /mnt/mac-signing-credentials/apple_app_specific_password)
+        APPLE_TEAM_ID=$(cat /mnt/mac-signing-credentials/apple_team_id)
+        QUAY_USER=$(cat /mnt/quay-secret/username)
+        QUAY_PASS=$(cat /mnt/quay-secret/password)
+
+        STDERR_FILE=/tmp/stderr.txt
+
+        # Validate we have DMGs
+        DMG_COUNT=$(jq 'length' <<< "$CREATED_DMGS")
+        if [ "$DMG_COUNT" -eq 0 ]; then
+            echo "ERROR: No DMGs found in created_dmgs array"
+            exit 1
+        fi
+
+        echo "Found $DMG_COUNT DMG(s) to sign"
+
+        exitfunc() {
+            local err=$1
+            local line=$2
+            local command="$3"
+            if [ "$err" -eq 0 ] ; then
+                echo -n "Success" > "$(results.result.path)"
+            else
+                echo "$0: ERROR '$command' failed at line $line - exited with status $err" \
+                  > "$(results.result.path)"
+                if [ -f "$STDERR_FILE" ] ; then
+                    grep -v "^\+" "$STDERR_FILE" | tail -c 512 | tee -a "$(results.result.path)"
+                fi
+            fi
+            exit $err
+        }
+        trap 'exitfunc $? $LINENO "$BASH_COMMAND"' EXIT
+
+        set -x
+
+        # Setup SSH
+        mkdir -p ~/.ssh
+        cp /mnt/mac-ssh-key/mac_id_rsa ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+
+        SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        SSH_CMD="ssh $SSH_OPTS ${MAC_USER}@${MAC_HOST}"
+
+        # Initialize output array
+        SIGNED_DMGS="[]"
+
+        # Loop over all DMGs
+        for i in $(seq 0 $((DMG_COUNT - 1))); do
+            DMG=$(jq -c ".[$i]" <<< "$CREATED_DMGS")
+            COMPONENT_NAME=$(jq -r '.component' <<< "$DMG")
+            ARCH=$(jq -r '.arch' <<< "$DMG")
+            DMG_PULLSPEC=$(jq -r '.pullspec' <<< "$DMG")
+            DMG_NAME=$(jq -r '.dmg_name' <<< "$DMG")
+
+            echo ""
+            echo "=== [$((i+1))/$DMG_COUNT] Signing DMG for $COMPONENT_NAME ($ARCH) ==="
+            echo "Pullspec: $DMG_PULLSPEC"
+            echo "DMG Name: $DMG_NAME"
+            echo "Output registry: $OUTPUT_REGISTRY"
+
+            # Run signing on the Mac VM
+            # Script: pull DMG, sign, notarize, staple, push
+            $SSH_CMD "
+                set -e
+                WORK_DIR=\$HOME/signing_work/${COMPONENT_NAME}_${ARCH}_\$\$
+                mkdir -p \"\$WORK_DIR/input\" \"\$WORK_DIR/output\"
+                cd \"\$WORK_DIR\"
+
+                echo '--- Installing oras if needed ---'
+                if ! command -v oras &> /dev/null; then
+                    brew install oras
+                fi
+
+                echo '--- Pulling unsigned DMG from OCI registry ---'
+                echo '$QUAY_PASS' | oras login quay.io -u '$QUAY_USER' --password-stdin
+                oras pull '$DMG_PULLSPEC' -o input/
+
+                echo '--- Finding DMG ---'
+                DMG_PATH=\$(find input -name '*.dmg' -type f | head -1)
+                if [ -z \"\$DMG_PATH\" ]; then
+                    echo 'ERROR: No .dmg file found in pulled artifact'
+                    ls -laR input/
+                    exit 1
+                fi
+                echo \"Found DMG: \$DMG_PATH\"
+
+                # Copy to working location
+                UNSIGNED_DMG=\"\$WORK_DIR/unsigned.dmg\"
+                SIGNED_DMG=\"\$WORK_DIR/output/$DMG_NAME\"
+                cp \"\$DMG_PATH\" \"\$UNSIGNED_DMG\"
+
+                echo '--- Signing DMG ---'
+                codesign --force --sign '$CSC_NAME' \"\$UNSIGNED_DMG\"
+
+                echo '--- Verifying signature ---'
+                codesign --verify --verbose \"\$UNSIGNED_DMG\"
+
+                echo '--- Notarizing DMG ---'
+                PROFILE_NAME='notary-profile'
+                xcrun notarytool store-credentials \"\$PROFILE_NAME\" \
+                    --apple-id '$APPLE_ID' \
+                    --password '$APPLE_APP_SPECIFIC_PASSWORD' \
+                    --team-id '$APPLE_TEAM_ID' 2>/dev/null || true
+
+                xcrun notarytool submit \"\$UNSIGNED_DMG\" \
+                    --keychain-profile \"\$PROFILE_NAME\" \
+                    --wait
+
+                echo '--- Stapling notarization ticket ---'
+                xcrun stapler staple \"\$UNSIGNED_DMG\"
+
+                echo '--- Verifying staple ---'
+                xcrun stapler validate \"\$UNSIGNED_DMG\"
+                spctl --assess --type open --context context:primary-signature -v \"\$UNSIGNED_DMG\" || true
+
+                # Move to output with final name
+                mv \"\$UNSIGNED_DMG\" \"\$SIGNED_DMG\"
+
+                echo '--- Pushing signed DMG to OCI registry ---'
+                OUTPUT_TAG='${OUTPUT_REGISTRY}/${COMPONENT_NAME}-dmg:${ARCH}-signed'
+                oras push \"\$OUTPUT_TAG\" \"\$SIGNED_DMG:application/octet-stream\"
+
+                echo \"SIGNED_PULLSPEC=\$OUTPUT_TAG\"
+
+                # Cleanup
+                rm -rf \"\$WORK_DIR\"
+            " 2>"$STDERR_FILE" | tee /tmp/signer_output.txt
+
+            # Parse output - get signed pullspec
+            SIGNED_PULLSPEC=$(grep "^SIGNED_PULLSPEC=" /tmp/signer_output.txt | cut -d= -f2 | tr -d '\r\n')
+
+            echo "Signed DMG pullspec: $SIGNED_PULLSPEC"
+
+            # Add to output array
+            SIGNED_DMGS=$(jq -c \
+                --arg component "$COMPONENT_NAME" \
+                --arg arch "$ARCH" \
+                --arg pullspec "$SIGNED_PULLSPEC" \
+                --arg dmg_name "$DMG_NAME" \
+                '. + [{component: $component, arch: $arch, pullspec: $pullspec, dmg_name: $dmg_name}]' \
+                <<< "$SIGNED_DMGS")
+        done
+
+        echo ""
+        echo "=== Sign-mac-dmg-v2 complete ==="
+        echo "Signed $DMG_COUNT DMG(s):"
+        jq '.' <<< "$SIGNED_DMGS"
+
+        # Write results
+        echo -n "$SIGNED_DMGS" > "$(results.signed_dmgs.path)"
